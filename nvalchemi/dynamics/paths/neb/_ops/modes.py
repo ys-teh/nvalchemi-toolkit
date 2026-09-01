@@ -12,37 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""Integer image-force modes used by the fused NEB kernels."""
+
 from __future__ import annotations
 
-from nvalchemi.data import transforms
-from nvalchemi.data.atomic_data import AtomicData
-from nvalchemi.data.batch import Batch
-from nvalchemi.data.datapipes import (
-    AtomicDataZarrReader,
-    AtomicDataZarrWriter,
-    BatchDatasetProtocol,
-    DataLoader,
-    Dataset,
-    InMemoryDataset,
-    Reader,
-)
-from nvalchemi.data.group_layout import GroupLayout
-from nvalchemi.data.transforms import Compose
+__all__ = ["CLIMBING_NEB", "ENDPOINT", "REGULAR_NEB"]
 
-__all__ = [
-    # Core
-    "AtomicData",
-    "Batch",
-    "GroupLayout",
-    # Datapipes
-    "Reader",
-    "AtomicDataZarrReader",
-    "AtomicDataZarrWriter",
-    "BatchDatasetProtocol",
-    "Dataset",
-    "InMemoryDataset",
-    "DataLoader",
-    # Transforms
-    "Compose",
-    "transforms",
-]
+ENDPOINT = 0
+REGULAR_NEB = 1
+CLIMBING_NEB = 2
