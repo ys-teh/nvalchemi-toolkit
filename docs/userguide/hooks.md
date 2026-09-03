@@ -96,6 +96,10 @@ Dynamics engines pass {py:class}`~nvalchemi.hooks.DynamicsContext`, which adds:
 |-------|------|---------|
 | `step_count` | `int` | Current dynamics step |
 | `converged_mask` | `torch.Tensor \| None` | Samples that converged at the current hook stage |
+| `active_graph_mask` | `torch.Tensor \| None` | Systems active for the current fused or sub-stage dispatch |
+
+Hooks should respect `active_graph_mask` when set to preserve
+{py:class}`~nvalchemi.dynamics.base.FusedStage` correctness.
 
 Training loops pass {py:class}`~nvalchemi.hooks.TrainContext`, which adds:
 
@@ -116,8 +120,9 @@ Training loops pass {py:class}`~nvalchemi.hooks.TrainContext`, which adds:
 | `validation` | `dict[str, Any] \| None` | Latest validation summary |
 
 The engine builds this context object at each stage via an overridable
-`_build_context(batch)` method. Custom engines should return their own
-`HookContext` subclass when hooks need workflow-specific fields.
+`_build_context(batch, **context_fields)` method. Custom engines should
+override it with matching keyword parameters and return their own `HookContext`
+subclass when hooks need workflow-specific fields.
 
 ### Optional context manager support
 
@@ -132,8 +137,8 @@ its logger.
 
 The hook system supports multiple **task categories** through stage enums:
 
-- **Dynamics**: {py:class}`~nvalchemi.dynamics.base.DynamicsStage` — 9 stages from
-  `BEFORE_STEP` through `ON_CONVERGE`
+- **Dynamics**: {py:class}`~nvalchemi.dynamics.base.DynamicsStage` — 10
+  lifecycle stages from `ON_ADMISSION` through `ON_CONVERGE`
 - **Custom pipelines**: Any custom `Enum` type — the hook system accepts arbitrary
   enum types via the `Enum` fallback
 
@@ -234,6 +239,11 @@ hook = LoggingHook(backend="csv", log_path="hooks.csv", frequency=10)  # log eve
 ```
 
 The hook implements the context manager protocol to manage its logger lifecycle.
+It writes one row per graph by default. For grouped workflows such as reaction
+paths, set `by_group=True` and return `(num_groups,)` tensors from
+`custom_scalars`. Group mode does not implicitly reduce graph-level energy,
+force, or temperature because those reductions are application dependent.
+
 It is the current built-in dynamics logger, not the full logging abstraction for
 all workflows.
 
