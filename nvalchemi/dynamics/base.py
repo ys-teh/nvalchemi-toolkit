@@ -1684,7 +1684,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         self,
         stage: DynamicsStage,
         batch: Batch,
-        active_graph_mask: torch.Tensor | None,
+        active_graph_mask: torch.Tensor | None = None,
     ) -> None:
         """Execute hooks for the given stage with dynamics-specific tracking."""
         self.current_hook_stage = stage
