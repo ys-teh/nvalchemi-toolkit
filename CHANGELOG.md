@@ -4,6 +4,9 @@
 
 ### Added
 
+- Add support for PEFT fine-tuning within `FineTuningStrategy`, including
+  LoRA workflows with `LoRAConfig`, `load_peft_checkpoint_into_model`,
+  and base-model fingerprint checks for PEFT checkpoint loading.
 - `FusedStage(reprime_on_entry=...)` — status codes whose newly entering
   graphs skip one integrator update so the shared compute and target-stage
   `AFTER_COMPUTE` hooks can refresh forces under the new stage's context
