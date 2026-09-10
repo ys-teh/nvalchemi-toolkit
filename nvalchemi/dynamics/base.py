@@ -2121,6 +2121,11 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         7. Check convergence and fire ON_CONVERGE hooks if any samples converged
         8. Increment step_count
 
+        Compute hooks run for every model evaluation. On the first call to
+        ``step()``, initial force priming evaluates the model before
+        ``step_count`` advances, and the normal step evaluates it again.
+        Consequently, both compute-hook dispatches receive ``step_count == 0``.
+
         Samples with ``status >= exit_status`` are treated as no-ops for the
         integrator (pre_update/post_update). Their positions and velocities
         are preserved through the step. This enables back-pressure handling
@@ -3667,6 +3672,13 @@ class FusedStage(BaseDynamics):
         If ``compile_step=True`` was set, this delegates to the compiled
         step implementation.
 
+        As in :class:`BaseDynamics`, initial force priming causes two
+        compute-hook dispatches at ``step_count == 0``. Transition repriming
+        instead occurs within the normal shared compute, so hooks are
+        dispatched once and ``step_count`` advances at the end of that fused
+        iteration. Transitioning graphs skip their dynamics update, so their
+        per-system stage counters do not advance.
+
         Parameters
         ----------
         batch : Batch
@@ -3795,7 +3807,7 @@ class FusedStage(BaseDynamics):
                 batch,
                 status == status_code,
             )
-        
+
         # Clear reprime flags for graphs whose forces were just primed.
         pending = batch.reprime_pending.view(-1)[: batch.num_graphs]
         if active_graph_mask is None:
