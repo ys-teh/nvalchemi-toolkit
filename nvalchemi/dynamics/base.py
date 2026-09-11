@@ -2281,7 +2281,6 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
 
         self._call_hooks(DynamicsStage.BEFORE_STEP, batch, active_graph_mask)
 
-
         with self._stream_scope(batch.device):
             self._call_hooks(
                 DynamicsStage.BEFORE_PRE_UPDATE,
@@ -3548,7 +3547,6 @@ class FusedStage(BaseDynamics):
         )
         self.register_hook(hook)
 
-
     def _mark_reprime_entries(
         self,
         batch: Batch,
@@ -3563,6 +3561,7 @@ class FusedStage(BaseDynamics):
             )
         batch.reprime_pending.view(-1)[: batch.num_graphs].logical_or_(entered)
         return current_status.clone()
+
     def _ensure_admission_initialized(self, batch: Batch) -> None:
         """Prepare fused-level and sub-stage hooks for an admitted batch."""
         if self._admission_initialized:
@@ -4009,7 +4008,7 @@ class FusedStage(BaseDynamics):
                 batch,
                 active_graph_mask,
             )
-        
+
         # Clear reprime flags for graphs whose forces were just primed.
         pending = batch.reprime_pending.view(-1)[: batch.num_graphs]
         if active_graph_mask is None:
