@@ -14,16 +14,25 @@
 # limitations under the License.
 """Nudged elastic band utilities."""
 
+from nvalchemi.dynamics.paths.neb._ops.registry import (
+    available_neb_methods,
+    register_neb_method,
+)
 from nvalchemi.dynamics.paths.neb.configs import (
     ConstantSpringConfig,
     NEBMethod,
     SpringConfig,
     SpringContext,
 )
+from nvalchemi.dynamics.paths.neb.neb import NEB, ClimbingImageConfig
 
 __all__ = [
+    "ClimbingImageConfig",
     "ConstantSpringConfig",
+    "NEB",
     "NEBMethod",
     "SpringConfig",
     "SpringContext",
+    "available_neb_methods",
+    "register_neb_method",
 ]

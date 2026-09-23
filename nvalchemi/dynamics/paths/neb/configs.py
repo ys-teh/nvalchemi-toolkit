@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
 import torch
@@ -86,7 +86,15 @@ class SpringContext:
 
 @runtime_checkable
 class SpringConfig(Protocol):
-    """Resolve spring constants for the links in one or more NEB paths."""
+    """Resolve spring constants for the links in one or more NEB paths.
+
+    Custom implementations are runtime-only:
+    :class:`~nvalchemi.dynamics.paths.neb.NEB` accepts them during engine
+    construction, but
+    :meth:`~nvalchemi.dynamics.paths.neb.NEB.to_spec_dict` cannot serialize them.
+    The ``refresh`` stage must remain unchanged for the lifetime of a configured
+    engine.
+    """
 
     refresh: Literal[
         DynamicsStage.ON_ADMISSION,
@@ -120,7 +128,10 @@ class ConstantSpringConfig:
     """
 
     value: float
-    refresh: Literal[DynamicsStage.ON_ADMISSION] = DynamicsStage.ON_ADMISSION
+    refresh: Literal[DynamicsStage.ON_ADMISSION] = field(
+        default=DynamicsStage.ON_ADMISSION,
+        init=False,
+    )
 
     def __post_init__(self) -> None:
         """Normalize and validate the constant spring value."""
@@ -164,9 +175,10 @@ class NEBMethod:
     climbing_force_fn : wp.Function, optional
         Construct the effective force for a climbing image.
     name : str or None, optional
-        Stable registry name. Named methods can participate in serializable
-        configurations when the same registration is available on restore;
-        unnamed methods are runtime-only.
+        Optional registry name used for kernel selection and caching. Method
+        objects remain runtime-only because their equation functions are not
+        captured by :meth:`NEB.to_spec_dict`; use the registered name in a
+        separate configuration when it must serialize.
 
     Examples
     --------
@@ -175,7 +187,7 @@ class NEBMethod:
 
         import warp as wp
 
-        from nvalchemi.dynamics.paths.neb.methods import NEBMethod
+        from nvalchemi.dynamics.paths.neb import NEBMethod
 
         @wp.func
         def central_tangent_weights(
