@@ -32,9 +32,10 @@ Hyperparameters:
 * ``curvature_eps`` — pair acceptance floor (default ``None``: by dtype)
 * ``maxstep``       — maximum displacement per step (default 0.2)
 
-State spans two levels: per-system scalars and a segmented ``"lbfgs_dofs"``
+State spans two levels: per-update-unit scalars and a segmented ``"lbfgs_dofs"``
 level (one row per atom, plus two per system for variable cell) holding
-the history.  Positions must not be edited between steps (e.g. by
+the history.  Fixed-cell LBFGS can use a group of graphs as one update unit.
+Positions must not be edited between steps (e.g. by
 ``WrapPeriodicHook``): the next step differences them against the last.
 """
 
@@ -157,6 +158,9 @@ class LBFGS(BaseDynamics):
         Initial hooks.
     convergence_hook : ConvergenceHook or dict, optional
         Convergence criterion.
+    by_group : bool, optional
+        Share one optimizer history across all graphs in each group. Forwarded
+        through ``**kwargs`` to :class:`~nvalchemi.dynamics.base.BaseDynamics`.
     **kwargs
         Forwarded to :class:`~nvalchemi.dynamics.base.BaseDynamics`.
 
@@ -203,8 +207,16 @@ class LBFGS(BaseDynamics):
         _refuse("history_size")
 
     def _init_state(self, batch: Batch) -> None:
+        atoms_per_update = (
+            torch.bincount(
+                self._update_idx(batch).long(),
+                minlength=self._num_update_units(batch),
+            )
+            if self.by_group
+            else batch.num_nodes_per_graph
+        )
         self._state = _build_state(
-            batch.num_nodes_per_graph,
+            atoms_per_update,
             self.history_size,
             batch.positions.dtype,
             batch.device,
@@ -232,7 +244,7 @@ class LBFGS(BaseDynamics):
             batch.positions.detach(),
             batch.forces,
             _ops_state(self._state),
-            batch.batch_idx.int(),
+            self._update_idx(batch),
             maxstep=self.maxstep,
             curvature_eps=self.curvature_eps,
         )

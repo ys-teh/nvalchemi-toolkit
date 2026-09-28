@@ -98,7 +98,7 @@ Key fields:
 | `spring` | `0.1` | Constant spring force, or a custom {py:class}`~nvalchemi.dynamics.paths.SpringConfig` |
 | `method` | `"improved_tangent"` | Named or custom `NEBMethod` (tangent, effective force, climbing force) |
 | `climbing` | `None` | `None` runs regular NEB only; set a `ClimbingImageConfig` to enable climbing-image NEB |
-| `optimizer` / `optimizer_kwargs` | `FIRE2` | Optimizer driving each image; kwargs forwarded to it |
+| `optimizer` / `optimizer_kwargs` | `FIRE2` | `FIRE2` or `LBFGS`, with kwargs forwarded to each optimizer stage |
 | `fmax` | `0.05` | Force threshold for the final (or only) stage |
 | `endpoint_mode` | `"fixed"` | `"fixed"` keeps endpoints static; `"relaxed"` lets them move |
 | `fixed_atom_indices` | `None` | Per-path, image-local atom indices held fixed in every image |
@@ -113,6 +113,13 @@ automatically --- `NEBForceHook` only computes *which* atoms are fixed (as a
 `neb_fixed_node_mask` batch field); `FreezeAtomsHook` is what actually zeroes
 their forces/velocities and restores their positions across integrator
 stages.
+
+To use L-BFGS, import `LBFGS` from `nvalchemi.dynamics.optimizers`, then pass
+`optimizer=LBFGS` and its options through
+`optimizer_kwargs`, for example `{"history_size": 6, "maxstep": 0.1}`.
+L-BFGS keeps a separate history for each path, combining the atoms from all
+images in that path into one update unit. FIRE2 remains the default and only
+FIRE2 receives NEB-tuned optimizer defaults.
 
 `ClimbingImageConfig.mode="after_regular"` runs regular NEB to
 `regular_fmax` (or `fmax` if unset) before promoting the highest-energy

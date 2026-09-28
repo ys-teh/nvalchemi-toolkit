@@ -35,6 +35,7 @@ from nvalchemi._serialization import SerializableClass
 from nvalchemi.dynamics.base import ConvergenceHook, FusedStage
 from nvalchemi.dynamics.hooks import FreezeAtomsHook, LoggingHook
 from nvalchemi.dynamics.optimizers.fire2 import FIRE2
+from nvalchemi.dynamics.optimizers.lbfgs import LBFGS
 from nvalchemi.dynamics.paths.hooks import (
     PathDiagnosticsHook,
     PathEnergyStatsHook,
@@ -193,8 +194,7 @@ class NEB(DynamicsStrategy):
     optimizer: SerializableClass = Field(
         default=FIRE2,
         description=(
-            "Optimizer class used by internal stages. Only FIRE2 is currently "
-            "supported."
+            "Optimizer class used by internal stages: FIRE2 or LBFGS."
         ),
     )
     optimizer_kwargs: dict[str, Any] = Field(
@@ -437,7 +437,7 @@ class NEB(DynamicsStrategy):
         if self.optimizer is FIRE2:
             for name, value in _NEB_FIRE2_DEFAULTS.items():
                 self.optimizer_kwargs.setdefault(name, value)
-        else:
+        elif self.optimizer is not LBFGS:
             raise NotImplementedError(
                 f"Unsupported NEB optimizer: {self.optimizer.__qualname__}"
             )
