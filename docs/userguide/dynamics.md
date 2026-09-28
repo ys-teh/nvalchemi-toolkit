@@ -68,7 +68,31 @@ Each step then proceeds through these stages in order:
    pipeline then migrate to the next stage.
 
 `run(batch, n_steps)` calls `step()` in a loop until all systems converge or
-`n_steps` is reached. Every hook declares which
+`n_steps` is reached. For standalone optimizers with staggered convergence,
+`run(..., compact=True)` retires each graph after its first converged step so
+later model calls only process survivors:
+
+```python
+result = optimizer.run(batch, n_steps=500, compact=True)
+```
+
+Always use the returned batch: compaction reconstructs every graph in its
+original input order, including unconverged graphs at the step limit, and the
+input batch is not the authoritative result. Captured states are independent
+copies. Ephemeral neighbor-list fields are omitted, so rebuild neighbors before
+passing the result to another model evaluation. `AFTER_STEP` and `ON_CONVERGE`
+hooks observe a graph before it retires; admission hooks run again after each
+resize and must preserve survivor semantics. Arbitrary hook-owned per-graph
+history is not reindexed automatically. `EnergyDriftMonitorHook`, samplers,
+`FusedStage`, and inter-rank pipeline stages are not supported in compact mode.
+
+Compact runs can call compiled models, but each new graph or atom count may
+trigger recompilation. Compiling the entire compacting loop with
+`fullgraph=True` is unsupported. If the step cap leaves survivors, optimizer
+state remains aligned with those active survivors, not with the reconstructed
+full result batch.
+
+Every hook declares which
 {py:class}`~nvalchemi.dynamics.base.DynamicsStage` stage it should fire at and at
 what frequency, so you have fine-grained control over when callbacks execute.
 

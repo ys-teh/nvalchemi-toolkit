@@ -1043,6 +1043,155 @@ class TestConvergenceHook:
         assert batch["status"][1].item() == 0
 
 
+class _CountdownDynamics(BaseDynamics):
+    """Dynamics that retires graphs after independent countdowns expire."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.compute_batch_sizes: list[int] = []
+
+    def compute(self, batch: Batch) -> dict[str, torch.Tensor]:
+        """Record model work before delegating to the normal compute path."""
+        self.compute_batch_sizes.append(batch.num_graphs)
+        return super().compute(batch)
+
+    def pre_update(self, batch: Batch) -> None:
+        """Advance each active graphs countdown and step marker."""
+        with torch.no_grad():
+            batch.countdown.sub_(1)
+            batch.retired_at.fill_(self.step_count + 1)
+
+    def _init_state(self, batch: Batch) -> None:
+        """Initialize graph-indexed state used to verify survivor alignment."""
+        from nvalchemi.dynamics._ops._bridge import _make_state_batch
+
+        self._state = _make_state_batch(
+            {"marker": torch.arange(batch.num_graphs, device=batch.device)},
+            batch.device,
+        )
+
+
+class TestCompactRun:
+    """Regression coverage for fixed-batch convergence retirement."""
+
+    @staticmethod
+    def _make_batch(
+        countdowns: list[int],
+        system_ids: list[int] | None = None,
+    ) -> Batch:
+        data = [
+            AtomicData(
+                atomic_numbers=torch.tensor([1, 1]),
+                positions=torch.full((2, 3), float(index)),
+                neighbor_matrix=torch.zeros(2, 2, dtype=torch.long),
+                neighbor_matrix_shifts=torch.zeros(2, 2, 3, dtype=torch.long),
+                num_neighbors=torch.zeros(2, dtype=torch.long),
+            )
+            for index in range(len(countdowns))
+        ]
+        batch = Batch.from_data_list(data)
+        batch["forces"] = torch.zeros(batch.num_nodes, 3)
+        batch["energy"] = torch.zeros(batch.num_graphs, 1)
+        batch["countdown"] = torch.tensor(countdowns).unsqueeze(-1)
+        batch["retired_at"] = torch.zeros(batch.num_graphs, 1, dtype=torch.long)
+        if system_ids is not None:
+            batch["system_id"] = torch.tensor(system_ids).unsqueeze(-1)
+        return batch
+
+    @staticmethod
+    def _make_dynamics(n_steps: int = 5) -> _CountdownDynamics:
+        return _CountdownDynamics(
+            DemoModelWrapper(DemoModel()),
+            n_steps=n_steps,
+            convergence_hook=ConvergenceHook(
+                criteria=[{"key": "countdown", "threshold": 0}]
+            ),
+        )
+
+    def test_staggered_retirement_preserves_input_order_and_ids(self) -> None:
+        """Graphs return at first convergence in input rather than retirement order."""
+        dynamics = self._make_dynamics()
+        batch = self._make_batch([3, 1, 2], system_ids=[7, 7, -4])
+        admissions: list[str] = []
+        convergences: list[str] = []
+        dynamics.register_hook(
+            RecordingHook(DynamicsStage.ON_ADMISSION, admissions, "admit")
+        )
+        dynamics.register_hook(
+            RecordingHook(DynamicsStage.ON_CONVERGE, convergences, "converge")
+        )
+
+        result = dynamics.run(batch, compact=True)
+
+        assert result.countdown.view(-1).tolist() == [0, 0, 0]
+        assert result.retired_at.view(-1).tolist() == [3, 1, 2]
+        assert result.system_id.view(-1).tolist() == [7, 7, -4]
+        assert dynamics.compute_batch_sizes == [3, 3, 2, 2, 1, 1]
+        assert not hasattr(dynamics, "_state")
+        assert admissions == ["admit", "admit", "admit"]
+        assert convergences == ["converge", "converge", "converge"]
+        assert "neighbor_matrix" in batch
+        assert "neighbor_matrix" not in result
+        assert "neighbor_matrix_shifts" not in result
+        assert "num_neighbors" not in result
+
+    def test_step_cap_collects_survivors_once(self) -> None:
+        """Unconverged graphs are included at their state at the step limit."""
+        dynamics = self._make_dynamics(n_steps=2)
+        batch = self._make_batch([5, 1])
+
+        result = dynamics.run(batch, compact=True)
+
+        assert result.countdown.view(-1).tolist() == [3, 0]
+        assert result.retired_at.view(-1).tolist() == [2, 1]
+        assert result.system_id.view(-1).tolist() == [0, 1]
+        assert dynamics.compute_batch_sizes == [2, 2, 1, 1]
+        assert dynamics._state.num_graphs == 1
+        assert dynamics._state.marker.item() == 0
+
+    def test_requires_convergence_detector_before_mutating_batch(self) -> None:
+        """Invalid compact mode fails before adding fallback identity."""
+        dynamics = BaseDynamics(DemoModelWrapper(DemoModel()), n_steps=1)
+        batch = self._make_batch([1])
+
+        with pytest.raises(ValueError, match="convergence detector"):
+            dynamics.run(batch, compact=True)
+
+        assert getattr(batch, "system_id", None) is None
+
+    def test_rejects_unsupported_configurations_before_mutation(self) -> None:
+        """Sampler, pipeline, and energy-history modes fail before mutation."""
+        from nvalchemi.dynamics.hooks import EnergyDriftMonitorHook
+
+        batch = self._make_batch([1])
+        sampler_dynamics = self._make_dynamics()
+        sampler_dynamics.sampler = object()
+        with pytest.raises(NotImplementedError, match="sampler"):
+            sampler_dynamics.run(batch, compact=True)
+
+        pipeline_dynamics = self._make_dynamics()
+        pipeline_dynamics.next_rank = 1
+        with pytest.raises(NotImplementedError, match="inter-rank"):
+            pipeline_dynamics.run(batch, compact=True)
+
+        monitor_dynamics = self._make_dynamics()
+        monitor_dynamics.register_hook(EnergyDriftMonitorHook(threshold=1.0))
+        with pytest.raises(NotImplementedError, match="EnergyDriftMonitorHook"):
+            monitor_dynamics.run(batch, compact=True)
+
+        assert getattr(batch, "system_id", None) is None
+
+    def test_fused_stage_rejects_compact_mode(self) -> None:
+        """FusedStage exposes the keyword but rejects it explicitly."""
+        from nvalchemi.dynamics.base import FusedStage
+
+        stage = BaseDynamics(DemoModelWrapper(DemoModel()))
+        fused = FusedStage(sub_stages=[(0, stage)])
+
+        with pytest.raises(NotImplementedError, match="FusedStage"):
+            fused.run(self._make_batch([1]), n_steps=1, compact=True)
+
+
 class TestNStepsAttribute:
     """Test suite for the n_steps construction-time attribute."""
 

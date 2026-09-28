@@ -1583,6 +1583,16 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         ),
     }
 
+    _ephemeral_neighbor_keys = frozenset(
+        {
+            "neighbor_matrix",
+            "num_neighbors",
+            "neighbor_matrix_shifts",
+            "neighbor_list",
+            "neighbor_list_shifts",
+        }
+    )
+
     @staticmethod
     def _validate_n_steps(n_steps: int | None) -> None:
         """Validate that a step count is a positive integer or None."""
@@ -2050,6 +2060,95 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         else:
             del self._state
 
+    def _clear_membership_caches(self) -> None:
+        """Invalidate state that refers to the previous batch membership."""
+        self._last_converged = None
+        self._admission_initialized = False
+        self._forces_primed = False
+        for _, sub_stage in getattr(self, "sub_stages", []):
+            sub_stage._last_converged = None
+            sub_stage._admission_initialized = False
+            sub_stage._forces_primed = False
+
+    @torch.compiler.disable
+    def _change_batch_membership(
+        self,
+        batch: Batch,
+        survivor_indices: torch.Tensor,
+        replacement_batch: Batch | None = None,
+    ) -> Batch | None:
+        """Select survivors, append replacements, and realign dynamics state.
+
+        This operation deliberately stays outside compiled step/model regions:
+        graph and atom counts may change, and all graph-indexed optimizer state
+        must be synchronized exactly once against the final membership.
+
+        Parameters
+        ----------
+        batch : Batch
+            Batch whose membership is changing.
+        survivor_indices : torch.Tensor
+            Indices of graphs to retain, in their desired order.
+        replacement_batch : Batch | None, optional
+            New graphs to append after the survivors.
+
+        Returns
+        -------
+        Batch | None
+            Reconstructed batch, or ``None`` when no graphs remain.
+        """
+        self._clear_membership_caches()
+
+        result = (
+            batch.index_select(survivor_indices)
+            if survivor_indices.numel() > 0
+            else None
+        )
+        n_new = 0 if replacement_batch is None else replacement_batch.num_graphs
+        if result is not None and replacement_batch is not None:
+            result.append(replacement_batch)
+        elif replacement_batch is not None:
+            result = replacement_batch
+
+        template = result if result is not None else batch
+        self._sync_state_to_batch(survivor_indices, n_new, template)
+        return result
+
+    @classmethod
+    def _snapshot_compact_results(
+        cls,
+        batch: Batch,
+        indices: torch.Tensor,
+    ) -> Batch:
+        """Return an independently owned snapshot without neighbor caches."""
+        _ = batch.batch_ptr
+        snapshot = batch.index_select(indices)
+        for key in cls._ephemeral_neighbor_keys:
+            try:
+                del snapshot[key]
+            except (KeyError, IndexError):
+                pass
+        for key, tensor in list(snapshot):
+            snapshot[key] = tensor.detach().clone()
+        return snapshot
+
+    def _validate_compact_run(self) -> None:
+        """Reject configurations whose state cannot yet be compacted safely."""
+        if self.convergence_hook is None:
+            raise ValueError("compact=True requires a convergence detector.")
+        if self.sampler is not None:
+            raise NotImplementedError("compact=True does not support a sampler.")
+        if self.has_neighbor:
+            raise NotImplementedError(
+                "compact=True does not support inter-rank pipeline stages."
+            )
+        from nvalchemi.dynamics.hooks.monitors import EnergyDriftMonitorHook
+
+        if any(isinstance(hook, EnergyDriftMonitorHook) for hook in self.hooks):
+            raise NotImplementedError(
+                "compact=True does not support EnergyDriftMonitorHook."
+            )
+
     def pre_update(self, batch: Batch) -> None:
         """
         Perform the first half of the integration step.
@@ -2331,39 +2430,39 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 active_graph_mask,
             )
 
-    def run(self, batch: Batch, n_steps: int | None = None) -> Batch:
-        """
-        Run the dynamics simulation for a specified number of steps.
+    def run(
+        self,
+        batch: Batch,
+        n_steps: int | None = None,
+        *,
+        compact: bool = False,
+    ) -> Batch:
+        """Run the dynamics simulation for a specified number of steps.
 
-        This is a convenience method that repeatedly calls ``step()``.
-        The step count can be set at construction time via the
-        ``n_steps`` parameter, or passed directly to this method.
-        A value passed here takes precedence over the instance
-        attribute.
+        With ``compact=True``, each graph is captured after its first
+        converged step and removed from later model evaluations. The returned
+        batch contains all original graphs in input order. Its neighbor-list
+        caches are omitted and must be rebuilt before another model evaluation.
 
-        May be called bare or inside the engine's context manager; the
-        two differ in CUDA stream behavior — see the **CUDA stream
-        semantics** notes on :class:`BaseDynamics`.
+        Compact runs may call compiled models, but changing graph and atom
+        counts can trigger recompilation. Compiling the entire compacting loop
+        with ``fullgraph=True`` is unsupported. If the step limit leaves active
+        graphs, optimizer state remains aligned to those survivors rather than
+        to the reconstructed full result batch.
 
         Parameters
         ----------
         batch : Batch
             The initial batch of atomic data.
         n_steps : int | None, optional
-            The number of steps to run.  If ``None``, falls back to
-            ``self.n_steps``.  If both are ``None``, raises
-            ``ValueError``.
+            Number of steps. Falls back to ``self.n_steps``.
+        compact : bool, optional
+            Retire graphs after first convergence. Default ``False``.
 
         Returns
         -------
         Batch
-            The batch after all steps have been executed.
-
-        Raises
-        ------
-        ValueError
-            If no step count is available (both the argument and
-            ``self.n_steps`` are ``None``).
+            Final states, in original input order.
         """
         resolved = n_steps if n_steps is not None else self.n_steps
         if resolved is None:
@@ -2373,25 +2472,80 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 f"`{type(self).__name__}(..., n_steps=N)`."
             )
         self._validate_n_steps(resolved)
+        if compact:
+            self._validate_compact_run()
+            if getattr(batch, "system_id", None) is None:
+                batch.add_key(
+                    "system_id",
+                    [
+                        torch.tensor([index], dtype=torch.long, device=batch.device)
+                        for index in range(batch.num_graphs)
+                    ],
+                    level="system",
+                )
+
         self._open_hooks()
         try:
-            # A run is a fresh admission even when the caller deliberately
-            # reuses the same Batch object from an earlier run.
             self._admission_initialized = False
             self._forces_primed = False
+            if compact:
+                return self._run_compact(batch, resolved)
+
             for _ in range(resolved):
-                batch, _converged = self.step(batch)
-                # Early exit when every system has satisfied the convergence
-                # criteria (sampler-free / Mode 1 only).
+                batch, converged = self.step(batch)
                 if (
                     self.sampler is None
-                    and _converged is not None
-                    and _converged.numel() == batch.num_graphs
+                    and converged is not None
+                    and converged.numel() == batch.num_graphs
                 ):
                     break
+            return batch
         finally:
             self._close_hooks()
-        return batch
+
+    def _run_compact(self, batch: Batch, n_steps: int) -> Batch:
+        """Execute the eager membership-changing compact run loop."""
+        active_original = torch.arange(
+            batch.num_graphs, dtype=torch.long, device=batch.device
+        )
+        collected_batches: list[Batch] = []
+        collected_indices: list[torch.Tensor] = []
+        active_batch: Batch | None = batch
+
+        for _ in range(n_steps):
+            if active_batch is None:
+                break
+            active_batch, converged = self.step(active_batch)
+            if converged is None or converged.numel() == 0:
+                continue
+
+            collected_batches.append(
+                self._snapshot_compact_results(active_batch, converged)
+            )
+            collected_indices.append(active_original[converged].detach().clone())
+
+            survivor_mask = torch.ones(
+                active_batch.num_graphs, dtype=torch.bool, device=batch.device
+            )
+            survivor_mask[converged] = False
+            survivor_indices = torch.where(survivor_mask)[0]
+            active_original = active_original[survivor_indices]
+            active_batch = self._change_batch_membership(active_batch, survivor_indices)
+
+        if active_batch is not None:
+            remaining = torch.arange(
+                active_batch.num_graphs, dtype=torch.long, device=batch.device
+            )
+            collected_batches.append(
+                self._snapshot_compact_results(active_batch, remaining)
+            )
+            collected_indices.append(active_original.detach().clone())
+
+        result = collected_batches[0]
+        for captured in collected_batches[1:]:
+            result.append(captured)
+        original_order = torch.cat(collected_indices).argsort()
+        return result.index_select(original_order)
 
     def refill_check(self, batch: Batch, exit_status: int) -> Batch | None:
         """Replace graduated samples via index-select and append.
@@ -2433,23 +2587,12 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         if not graduated_mask.any():
             return batch
 
-        # Batch composition changes here; drop stale converged indices so the
-        # next _build_context mask doesn't over-index the resized batch.
-        self._last_converged = None
-        self._admission_initialized = False
-        self._forces_primed = False
-
         remaining_indices = torch.where(~graduated_mask)[0]
 
         if self.sinks and graduated_mask.any():
             self._overflow_to_sinks(batch, mask=graduated_mask)
 
         n_remaining = remaining_indices.numel()
-
-        if remaining_indices.numel() > 0:
-            result = batch.index_select(remaining_indices)
-        else:
-            result = None
 
         # Budget-based replacement: compute total atom/edge headroom
         # from the remaining systems and the sampler's constraints.
@@ -2485,11 +2628,14 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             max_count=max_new,
         )
 
-        if result is not None and replacements:
-            repl_batch = Batch.from_data_list(replacements, device=batch.device)
-            result.append(repl_batch)
-        elif result is None and replacements:
-            result = Batch.from_data_list(replacements, device=batch.device)
+        replacement_batch = (
+            Batch.from_data_list(replacements, device=batch.device)
+            if replacements
+            else None
+        )
+        result = self._change_batch_membership(
+            batch, remaining_indices, replacement_batch
+        )
 
         if result is not None:
             n_total = result.num_graphs
@@ -2519,12 +2665,10 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                     new_tensor[:n_remaining] = src
                 result[key] = new_tensor
 
-            self._sync_state_to_batch(remaining_indices, len(replacements), result)
             return result
 
         if self.sampler.exhausted:
             self.done = True
-        self._sync_state_to_batch(remaining_indices, 0, batch)
         return None
 
     def masked_update(
@@ -3948,7 +4092,11 @@ class FusedStage(BaseDynamics):
             pending.logical_and_(~active_graph_mask)
 
     def run(
-        self, batch: Batch | None = None, n_steps: int | None = None
+        self,
+        batch: Batch | None = None,
+        n_steps: int | None = None,
+        *,
+        compact: bool = False,
     ) -> Batch | None:
         """Run the fused stage until all samples converge or the sampler is exhausted.
 
@@ -3987,6 +4135,9 @@ class FusedStage(BaseDynamics):
             ``n_steps`` when such a stage is the final sub-stage.
             Note: sub-stages with ``n_steps`` set use that value as a per-system
             step budget for automatic migration to the next stage.
+        compact : bool, optional
+            Accepted for API consistency. ``True`` is not supported by
+            ``FusedStage`` and raises ``NotImplementedError``.
 
         Returns
         -------
@@ -3998,7 +4149,12 @@ class FusedStage(BaseDynamics):
         ------
         ValueError
             If ``batch is None`` and no sampler is configured.
+        NotImplementedError
+            If ``compact`` is ``True``.
         """
+        if compact:
+            raise NotImplementedError("compact=True is not supported by FusedStage.")
+
         if batch is None:
             if self.sampler is None:
                 raise ValueError("No batch provided and no sampler configured.")

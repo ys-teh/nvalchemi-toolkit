@@ -78,6 +78,9 @@ class LoggingHook:
 
     * **step** — the current ``dynamics.step_count``.
     * **graph_idx** — the graph's index within the batch.
+    * **system_id** — the stable sample identifier when the batch provides one.
+      During compact runs, missing identifiers are initialized from original
+      input row indices; supplied values are preserved.
     * **status** — the sample's status code (from ``batch.status``),
       indicating which pipeline stage it belongs to.  Always ``0`` for
       single-stage dynamics.
@@ -318,6 +321,10 @@ class LoggingHook:
             td.set("status", status.float())
         else:
             td.set("status", torch.zeros(num_graphs, device=dev))
+
+        system_id = getattr(batch, "system_id", None)
+        if system_id is not None:
+            td.set("system_id", system_id.reshape(num_graphs))
 
         if batch.energy is not None:
             # ``reshape`` (not ``squeeze(-1)``): per-graph energy arrives as

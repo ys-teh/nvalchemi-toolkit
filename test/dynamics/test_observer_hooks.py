@@ -312,6 +312,21 @@ class TestLoggingHook:
             assert row["graph_idx"] == float(i)
             assert "status" in row  # 0.0 when no status on batch
 
+    def test_row_includes_system_id_when_available(self, device: str) -> None:
+        """Stable system identity is logged alongside current graph index."""
+        hook, captured = self._capture_hook()
+        batch = _make_batch(n_graphs=2, device=device)
+        batch["system_id"] = torch.tensor([[11], [7]], device=batch.device)
+        dynamics = _make_dynamics(device=device)
+        ctx = _make_ctx(batch, dynamics)
+
+        with hook:
+            hook(ctx, DynamicsStage.AFTER_STEP)
+
+        rows = captured[0][1]
+        assert [row["graph_idx"] for row in rows] == [0.0, 1.0]
+        assert [row["system_id"] for row in rows] == [11.0, 7.0]
+
     def test_per_graph_energy_and_fmax(self, device: str) -> None:
         hook, captured = self._capture_hook()
         batch = _make_batch(n_graphs=2, device=device)
