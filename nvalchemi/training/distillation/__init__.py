@@ -12,18 +12,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Backend implementations for datapipe storage."""
+"""Knowledge-distillation workflows for ALCHEMI training."""
 
 from __future__ import annotations
 
-from nvalchemi.data.datapipes.backends.zarr import (
-    AtomicDataZarrReader,
-    AtomicDataZarrWriter,
-    FieldSchema,
+from nvalchemi.training.distillation.labeling import label_dataset
+from nvalchemi.training.distillation.scoring import (
+    BUILTIN_SIGNALS,
+    SUPPORTED_SIGNALS,
+    InProcessTeacherScorer,
+    NeighborListPolicy,
+    SignalLevel,
+    TeacherLabels,
+    TeacherScorer,
+    TeacherSignal,
+    scorer_fields,
+    signal_fields,
+    signal_for_field,
 )
 
 __all__ = [
-    "AtomicDataZarrReader",
-    "AtomicDataZarrWriter",
-    "FieldSchema",
+    "BUILTIN_SIGNALS",
+    "InProcessTeacherScorer",
+    "NeighborListPolicy",
+    "SUPPORTED_SIGNALS",
+    "SignalLevel",
+    "TeacherLabels",
+    "TeacherScorer",
+    "TeacherSignal",
+    "label_dataset",
+    "scorer_fields",
+    "signal_fields",
+    "signal_for_field",
 ]

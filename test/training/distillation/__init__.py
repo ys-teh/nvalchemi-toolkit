@@ -12,17 +12,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Geometry optimizers: FIRE, FIRE2 and L-BFGS (fixed-cell and variable-cell)."""
-
-from nvalchemi.dynamics.optimizers.fire import FIRE, FIREVariableCell
-from nvalchemi.dynamics.optimizers.fire2 import FIRE2, FIRE2VariableCell
-from nvalchemi.dynamics.optimizers.lbfgs import LBFGS, LBFGSVariableCell
-
-__all__ = [
-    "FIRE",
-    "FIREVariableCell",
-    "FIRE2",
-    "FIRE2VariableCell",
-    "LBFGS",
-    "LBFGSVariableCell",
-]
+from __future__ import annotations

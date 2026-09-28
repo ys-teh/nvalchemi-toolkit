@@ -71,6 +71,7 @@ from torch import distributed as dist
 
 from nvalchemi._typing import AtomsLike, ModelOutputs
 from nvalchemi.data import Batch
+from nvalchemi.data.level_storage import SegmentedLevelStorage
 from nvalchemi.hooks._context import DynamicsContext
 from nvalchemi.hooks._protocol import Hook
 from nvalchemi.hooks._registry import HookRegistryMixin
@@ -1480,6 +1481,18 @@ class _CommunicationMixin:
         )
 
 
+def _level_mask(
+    state: Batch, level: str, graph_mask: Bool[torch.Tensor, "B"]
+) -> torch.Tensor:
+    """Broadcast a per-graph mask to the rows of one materialized state level."""
+    group = state._storage.groups.get(level)
+    if group is None:
+        raise KeyError(f"state level {level!r} is not materialized")
+    if isinstance(group, SegmentedLevelStorage):
+        return graph_mask[group.batch_idx.long()]
+    return graph_mask
+
+
 class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
     """Base class for all dynamics simulations.
 
@@ -1581,6 +1594,9 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
     __provides_keys__: set[str] = set()
 
     _mutable_fields: tuple[str, ...] = ("positions", "velocities", "cell")
+
+    # Hooks of the enclosing FusedStage, if any; set (live) by FusedStage.
+    _enclosing_hooks: Sequence[Hook] = ()
 
     _bookkeeping_keys: dict[str, Callable[[int, torch.device], torch.Tensor]] = {
         "status": lambda n, dev: torch.zeros(n, 1, dtype=torch.long, device=dev),
@@ -1920,7 +1936,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         ``post_update`` on the full batch to preserve static shapes. State
         changes are retained for update units selected by ``graph_mask``. A
         grouped state row is retained when at least one graph in its group is
-        selected; other rows are restored from ``saved``.
+        selected; other rows are restored from ``saved``. Segmented state
+        levels expand this update-unit mask through their own ``batch_idx``.
         """
         if not saved:
             return
@@ -1933,10 +1950,24 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
                 f"update units: state={self._state.num_graphs}, "
                 f"updates={state_mask.shape[0]}."
             )
-        for key, previous in saved.items():
-            value = getattr(self._state, key)
-            mask = state_mask.view(state_mask.shape[0], *([1] * (value.dim() - 1)))
-            torch.where(mask, value, previous, out=value)
+        for level, keys in self._state.level_keys.items():
+            keys = keys & saved.keys()
+            if not keys:
+                continue
+            level_mask = _level_mask(self._state, level, state_mask)
+            for key in keys:
+                value = getattr(self._state, key)
+                mask = level_mask.view(level_mask.shape[0], *([1] * (value.dim() - 1)))
+                torch.where(mask, value, saved[key], out=value)
+
+    def _warm_state_levels(self) -> None:
+        """Build lazy segmented-level topology outside a compiled step."""
+        state = getattr(self, "_state", None)
+        if state is None:
+            return
+        for group in state._storage.groups.values():
+            if isinstance(group, SegmentedLevelStorage):
+                _ = group.batch_idx, group.batch_ptr
 
     def _init_state(self, batch: Batch) -> None:
         """Allocate per-system integrator state from the first concrete batch.
@@ -3294,6 +3325,8 @@ class FusedStage(BaseDynamics):
         super().__init__(model=model, **kwargs)
 
         self.sub_stages = sub_stages
+        for _, dynamics in sub_stages:
+            dynamics._enclosing_hooks = self.hooks
 
         known_status_codes = {code for code, _ in sub_stages}
         requested_reprime = set() if reprime_on_entry is None else reprime_on_entry
@@ -3966,6 +3999,7 @@ class FusedStage(BaseDynamics):
         self._ensure_bookkeeping_fields(batch)
         for _, dynamics in self.sub_stages:
             dynamics._ensure_state_initialized(batch)
+            dynamics._warm_state_levels()
 
         # Admission hooks remain outside of the compiled step
         self._ensure_admission_initialized(batch)
