@@ -63,8 +63,8 @@ the custom doubly nudged force equation. The example writes
 ``NVALCHEMI_SHOW_INITIAL_PATHS=0`` to omit the linear and post-IDPP curves and
 skip their additional model evaluations.
 
-The full plotted workflow runs in about 40--70 seconds on a single NVIDIA L4
-GPU.
+The full plotted workflow typically runs in less than one minute on a single
+NVIDIA L4 GPU.
 
 """
 
@@ -81,6 +81,7 @@ from typing import Any
 import numpy as np
 import torch
 from aimnet.calculators import AIMNet2Calculator
+from aimnet.calculators.calculator import AdaptiveNeighborList
 from torch import nn
 
 from nvalchemi._typing import ModelOutputs
@@ -201,8 +202,8 @@ print(f"IDPP converged for all paths (fmax <= {idpp.fmax} eV/angstrom)")
 # %%
 # Load the model
 # --------------
-# The ``AIMNet2rxnWrapper`` below is constructed around
-# :class:`aimnet.calculators.AIMNet2Calculator` and exposes the toolkit model
+# For simplicity, the ``AIMNet2rxnWrapper`` below uses
+# :class:`aimnet.calculators.AIMNet2Calculator` to expose the toolkit model
 # interface required by NEB. It loads the complete ``aimnet2-rxn`` potential,
 # including the Coulomb and D3 contributions selected by the checkpoint.
 #
@@ -210,18 +211,85 @@ print(f"IDPP converged for all paths (fmax <= {idpp.fmax} eV/angstrom)")
 # the raw neural network and disables those calculator-managed contributions so
 # they can be composed explicitly with toolkit models. Calling the calculator
 # directly preserves them for this example.
+#
+# AIMNet builds its own neighbor lists using toolkit-ops. This adapter leaves
+# ``neighbor_config=None``, so NEB adds no :class:`~nvalchemi.hooks.NeighborListHook`.
+
+
+class _MoleculeSizedNeighborList(AdaptiveNeighborList):
+    """Reset nonperiodic capacity using the calculator's current molecule size.
+
+    AIMNet can shrink SR capacity, and the installed matrix backend can silently
+    truncate larger inputs. AIMNet also resets LR capacity from total batch atoms.
+    Using the largest molecule before every build prevents both problems.
+    This workaround depends on private AIMNet attributes.
+    """
+
+    def __init__(
+        self, calculator: AIMNet2Calculator, original: AdaptiveNeighborList
+    ) -> None:
+        """Preserve the original list settings and track the owning calculator."""
+        super().__init__(
+            cutoff=original.cutoff,
+            target_utilization=original.target_utilization,
+        )
+        self.max_neighbors = original.max_neighbors
+        self.calculator = calculator
+
+    def __call__(
+        self,
+        positions: torch.Tensor,
+        cell: torch.Tensor | None = None,
+        pbc: torch.Tensor | None = None,
+        batch_idx: torch.Tensor | None = None,
+        fill_value: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Build neighbors, bounding capacity only on AIMNet's nonperiodic path."""
+        if cell is None:
+            # Reset on every call: AIMNet can shrink SR or reset LR to total atoms.
+            size = int(self.calculator._max_mol_size)
+            self.max_neighbors = max(16, self._round_to_16(size))
+        return super().__call__(
+            positions,
+            cell=cell,
+            pbc=pbc,
+            batch_idx=batch_idx,
+            fill_value=fill_value,
+        )
 
 
 class AIMNet2rxnWrapper(nn.Module, BaseModelMixin):
-    """Expose the full AIMNet2-rxn calculator through the toolkit model API."""
+    """Expose the full AIMNet2-rxn calculator through the toolkit model API.
+
+    Notes
+    -----
+    The calculator builds both short- and long-range neighbor lists using
+    toolkit-ops. This adapter therefore needs no
+    :class:`~nvalchemi.hooks.NeighborListHook`.
+    """
 
     def __init__(
         self,
         device: torch.device,
         *,
         compile_model: bool = False,
+        complete_sr_neighbors: bool = False,
+        molecule_sized_lr: bool = False,
     ) -> None:
-        """Initialize the AIMNet2-rxn adapter."""
+        """Initialize the AIMNet2-rxn adapter.
+
+        Parameters
+        ----------
+        device : torch.device
+            Device for calculator inference.
+        compile_model : bool, optional
+            Compile the neural-network forward calculation.
+        complete_sr_neighbors : bool, optional
+            Reset nonperiodic SR capacity to fit the largest current molecule.
+        molecule_sized_lr : bool, optional
+            Bound nonperiodic LR capacity by molecule size. Requires AIMNet's
+            shared infinite-cutoff Coulomb list (represented by cutoff 1e6).
+        """
         super().__init__()
         self.calculator = AIMNet2Calculator(
             model="aimnet2-rxn",
@@ -229,6 +297,21 @@ class AIMNet2rxnWrapper(nn.Module, BaseModelMixin):
             compile_model=compile_model,
             train=False,
         )
+        if complete_sr_neighbors:
+            self.calculator._nblist = _MoleculeSizedNeighborList(
+                self.calculator, self.calculator._nblist
+            )
+        if molecule_sized_lr:
+            lr = self.calculator._nblist_lr
+            if (
+                lr is None
+                or self.calculator._coulomb_cutoff != float("inf")
+                or lr.cutoff != 1e6
+            ):
+                raise ValueError(
+                    "molecule_sized_lr requires AIMNet's shared infinite-cutoff LR list"
+                )
+            self.calculator._nblist_lr = _MoleculeSizedNeighborList(self.calculator, lr)
         self.model = self.calculator.model
         self.model_config = ModelConfig(
             outputs=frozenset({"energy", "forces"}),
@@ -274,8 +357,13 @@ class AIMNet2rxnWrapper(nn.Module, BaseModelMixin):
         return OrderedDict(energy=energy, forces=output["forces"])
 
 
-# Use the compile path for the model to accelerate the neural-network forward calculations.
-model = AIMNet2rxnWrapper(device, compile_model=True).eval()
+# Use eager inference by default. Set compile_model=True to opt into AIMNet compilation.
+model = AIMNet2rxnWrapper(
+    device,
+    compile_model=False,
+    complete_sr_neighbors=True,
+    molecule_sized_lr=True,
+).eval()
 
 # %%
 # Run the NEB
