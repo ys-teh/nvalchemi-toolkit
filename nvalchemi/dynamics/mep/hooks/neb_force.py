@@ -342,22 +342,41 @@ class NEBForceHook:
         dtype = batch.positions.dtype
         device = batch.device
 
+        def workspace_buffer(
+            name: str, shape: tuple[int, ...], buffer_dtype: torch.dtype
+        ) -> Tensor:
+            """Reuse a kernel buffer when its size, dtype, and device still fit."""
+            value = getattr(old_workspace, name, None)
+            if (
+                value is not None
+                and value.shape == shape
+                and value.dtype == buffer_dtype
+                and value.device == device
+            ):
+                return value
+            return torch.empty(shape, dtype=buffer_dtype, device=device)
+
         # Each path's first and last images use endpoint force handling.
         last_rank: Tensor = layout.num_graphs_per_group[layout.group_idx] - 1
         is_terminal = layout.graph_rank == last_rank
         is_endpoint = (layout.graph_rank == 0) | is_terminal
-        force_mode = torch.full_like(
-            layout.group_idx,
-            REGULAR_NEB,
-            dtype=torch.int32,
+        force_mode = (
+            batch.force_mode
+            if "force_mode" in batch
+            else torch.empty_like(layout.group_idx, dtype=torch.int32)
         )
-        force_mode[is_endpoint] = ENDPOINT
+        if "force_mode" in batch:
+            force_mode[admitted] = REGULAR_NEB
+            force_mode[admitted & is_endpoint] = ENDPOINT
+        else:
+            force_mode.fill_(REGULAR_NEB)
+            force_mode[is_endpoint] = ENDPOINT
 
         # Identify fixed atoms including those in fixed endpoints.
-        fixed_atoms = torch.zeros(
-            batch.num_nodes,
-            dtype=torch.bool,
-            device=device,
+        fixed_atoms = (
+            batch.neb_fixed_node_mask
+            if "neb_fixed_node_mask" in batch
+            else torch.zeros(batch.num_nodes, dtype=torch.bool, device=device)
         )
         if self.fixed_atom_mask_key is not None:
             supplied = getattr(batch, self.fixed_atom_mask_key, None)
@@ -367,7 +386,9 @@ class NEBForceHook:
                 or supplied.dtype != torch.bool
             ):
                 raise ValueError("fixed_atom_mask_key must name a boolean node mask")
-            fixed_atoms.copy_(supplied)
+            fixed_atoms[admitted_nodes] = supplied[admitted_nodes]
+        else:
+            fixed_atoms[admitted_nodes] = False
         if self.fixed_atom_indices is not None:
             num_nodes_per_image = batch.num_nodes_per_graph
             for path_index, atom_indices in self.fixed_atom_indices.items():
@@ -389,13 +410,7 @@ class NEBForceHook:
                         )
                     fixed_atoms[image_starts + atom_index] = True
         if self.endpoint_mode == "fixed":
-            fixed_atoms[is_endpoint[batch.batch_idx.long()]] = True
-        if "force_mode" in batch:
-            force_mode = torch.where(admitted, force_mode, batch.force_mode)
-        if "neb_fixed_node_mask" in batch:
-            fixed_atoms = torch.where(
-                admitted_nodes, fixed_atoms, batch.neb_fixed_node_mask
-            )
+            fixed_atoms[admitted_nodes & is_endpoint[batch.batch_idx.long()]] = True
 
         # `validate_paths` guarantees cell and PBC consistency within each path,
         # so the kernels only need the first image's geometry. Missing cells use
@@ -404,32 +419,54 @@ class NEBForceHook:
         pbcs = batch.pbc if "pbc" in batch else None
         # Graph indices selecting the first image of each path.
         first_image_idx = layout.group_ptr[:-1]
+        path_cell = workspace_buffer("cell", (layout.num_groups, 3, 3), dtype)
         if cells is None:
-            path_cell = (
-                torch.eye(3, dtype=dtype, device=device)
-                .unsqueeze(0)
-                .repeat(layout.num_groups, 1, 1)
-            )
+            path_cell.zero_()
+            path_cell.diagonal(dim1=-2, dim2=-1).fill_(1)
         else:
-            path_cell = cells[first_image_idx].to(dtype=dtype).contiguous()
+            path_cell.copy_(cells[first_image_idx])
+        path_pbc = workspace_buffer("pbc", (layout.num_groups, 3), torch.bool)
         if pbcs is None:
-            path_pbc = torch.zeros(
-                layout.num_groups, 3, dtype=torch.bool, device=device
-            )
+            path_pbc.zero_()
         else:
-            path_pbc = pbcs[first_image_idx].bool().contiguous()
+            path_pbc.copy_(pbcs[first_image_idx])
+
+        link_source_image_idx = torch.where(~is_terminal)[0].contiguous()
+        retained_links = None
+        retained_springs = None
+        if (
+            admission is not None
+            and admission.previous_group_indices is not None
+            and old_workspace is not None
+            and old_link_ptr is not None
+            and self.spring.refresh == DynamicsStage.ON_ADMISSION
+        ):
+            link_groups = layout.group_idx[link_source_image_idx]
+            old_groups = admission.previous_group_indices[link_groups]
+            retained_links = old_groups >= 0
+            link_rank = link_source_image_idx - layout.group_ptr[link_groups]
+            old_links = (
+                old_link_ptr[old_groups[retained_links]] + link_rank[retained_links]
+            )
+            retained_springs = old_workspace.spring_constants[old_links]
 
         n_links = batch.num_graphs - layout.num_groups
-        spring_constants = torch.empty(n_links, dtype=dtype, device=device)
+        spring_constants = workspace_buffer("spring_constants", (n_links,), dtype)
 
         # Normalize kernel index buffers to int32.
         int32_max = torch.iinfo(torch.int32).max
         if batch.num_graphs > int32_max or batch.num_nodes > int32_max:
             raise ValueError("Path kernel layout exceeds int32 index capacity")
-        image_ptr = batch.batch_ptr.to(torch.int32).contiguous()
-        path_ptr = layout.group_ptr.to(torch.int32).contiguous()
-        image_path_idx = layout.group_idx.to(torch.int32).contiguous()
-        link_source_image_idx = torch.where(~is_terminal)[0].contiguous()
+        image_ptr = workspace_buffer("image_ptr", (batch.num_graphs + 1,), torch.int32)
+        path_ptr = workspace_buffer("path_ptr", (layout.num_groups + 1,), torch.int32)
+        image_path_idx = workspace_buffer(
+            "image_path_idx", (batch.num_graphs,), torch.int32
+        )
+        image_ptr.copy_(batch.batch_ptr)
+        path_ptr.copy_(layout.group_ptr)
+        image_path_idx.copy_(layout.group_idx)
+        link_sources = workspace_buffer("link_source_image_idx", (n_links,), torch.long)
+        link_sources.copy_(link_source_image_idx)
 
         # Include fields shared with other hooks on `Batch`.
         def set_batch_field(key: str, value: Tensor, level: str) -> None:
@@ -440,7 +477,8 @@ class NEBForceHook:
                     and target.dtype == value.dtype
                     and target.device == value.device
                 ):
-                    target.copy_(value)
+                    if target is not value:
+                        target.copy_(value)
                     return
             values = (
                 list(value.unbind())
@@ -450,25 +488,21 @@ class NEBForceHook:
             batch.add_key(key, values, level=level, overwrite=key in batch)
 
         set_batch_field("force_mode", force_mode, "system")
-        set_batch_field(
-            "physical_forces",
-            (
-                torch.where(admitted_nodes.unsqueeze(-1), 0, batch.physical_forces)
-                if "physical_forces" in batch
-                else torch.zeros_like(batch.positions)
-            ),
-            "node",
-        )
+        if "physical_forces" in batch:
+            batch.physical_forces[admitted_nodes] = 0
+        else:
+            set_batch_field(
+                "physical_forces", torch.zeros_like(batch.positions), "node"
+            )
         set_batch_field("neb_fixed_node_mask", fixed_atoms, "node")
-        set_batch_field(
-            "forward_link_length",
-            (
-                torch.where(admitted, 0, batch.forward_link_length)
-                if "forward_link_length" in batch
-                else torch.zeros(batch.num_graphs, dtype=dtype, device=device)
-            ),
-            "system",
-        )
+        if "forward_link_length" in batch:
+            batch.forward_link_length[admitted] = 0
+        else:
+            set_batch_field(
+                "forward_link_length",
+                torch.zeros(batch.num_graphs, dtype=dtype, device=device),
+                "system",
+            )
 
         # Keep kernel-only masks and buffers private on workspace.
         prepared_mic = prepare_batch_mic(batch, path_cell, path_pbc)
@@ -478,10 +512,12 @@ class NEBForceHook:
             cell=path_cell,
             pbc=path_pbc,
             mic=prepared_mic,
-            effective_forces=torch.empty_like(batch.positions),
-            link_lengths=torch.empty(n_links, dtype=dtype, device=device),
+            effective_forces=workspace_buffer(
+                "effective_forces", tuple(batch.positions.shape), dtype
+            ),
+            link_lengths=workspace_buffer("link_lengths", (n_links,), dtype),
             vector_scratch=(
-                torch.empty_like(batch.positions)
+                workspace_buffer("vector_scratch", tuple(batch.positions.shape), dtype)
                 if self.method_key is not None
                 and self.method_key.startswith("stored_tangent|")
                 else None
@@ -489,30 +525,24 @@ class NEBForceHook:
             image_ptr=image_ptr,
             path_ptr=path_ptr,
             image_path_idx=image_path_idx,
-            link_source_image_idx=link_source_image_idx,
+            link_source_image_idx=link_sources,
         )
 
         self._refresh_spring_constants(ctx, DynamicsStage.ON_ADMISSION)
-        self._link_ptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.long, device=device),
-                (layout.num_graphs_per_group - 1).cumsum(0),
-            ]
-        )
         if (
-            admission is not None
-            and admission.previous_group_indices is not None
-            and old_workspace is not None
-            and old_link_ptr is not None
-            and self.spring.refresh == DynamicsStage.ON_ADMISSION
+            old_link_ptr is not None
+            and old_link_ptr.shape == (layout.num_groups + 1,)
+            and old_link_ptr.device == device
         ):
-            for new, old in enumerate(admission.previous_group_indices.tolist()):
-                if old >= 0:
-                    start, end = self._link_ptr[new : new + 2].tolist()
-                    old_start, old_end = old_link_ptr[old : old + 2].tolist()
-                    spring_constants[start:end].copy_(
-                        old_workspace.spring_constants[old_start:old_end]
-                    )
+            self._link_ptr = old_link_ptr
+        else:
+            self._link_ptr = torch.empty(
+                layout.num_groups + 1, dtype=torch.long, device=device
+            )
+        self._link_ptr[0] = 0
+        torch.cumsum(layout.num_graphs_per_group - 1, 0, out=self._link_ptr[1:])
+        if retained_links is not None:
+            spring_constants[retained_links] = retained_springs
 
     def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:
         """Prepare NEB state or construct NEB forces.

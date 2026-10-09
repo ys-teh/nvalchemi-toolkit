@@ -1030,6 +1030,8 @@ class _CommunicationMixin:
         previous: Batch | None,
         current: Batch | None,
         retained_graphs: torch.Tensor,
+        *,
+        replacement_graphs: torch.Tensor | None = None,
     ) -> None:
         """Synchronize state and compose hook mappings after membership changes."""
         template = current if current is not None else previous
@@ -1058,9 +1060,22 @@ class _CommunicationMixin:
             )
         else:
             n_new_units = n_new
+        replacement_units = replacement_graphs
+        if replacement_graphs is not None and self.by_group:
+            replacement_units = torch.unique_consecutive(
+                current.group_idx[replacement_graphs]
+            )
+        if replacement_graphs is not None and group_map is not None:
+            group_map = torch.arange(n_groups, device=template.device)
+            group_map[replacement_units] = -1
         sync_state = getattr(self, "_sync_state_to_batch", None)
         if callable(sync_state):
-            sync_state(units, n_new_units, template)
+            if replacement_graphs is None:
+                sync_state(units, n_new_units, template)
+            else:
+                sync_state(
+                    units, n_new_units, template, replacement_indices=replacement_units
+                )
         if current is None:
             self._pending_admission = None
         else:
@@ -1070,16 +1085,41 @@ class _CommunicationMixin:
                     torch.full((n_new,), -1, dtype=torch.long, device=template.device),
                 ]
             )
+            if replacement_graphs is not None:
+                graph_map = torch.arange(n_graphs, device=template.device)
+                graph_map[replacement_graphs] = -1
+            retained_slots = (
+                retained_graphs
+                if replacement_graphs is not None
+                else slice(0, n_retained)
+            )
+            retained_group_slots = (
+                units if replacement_graphs is not None else slice(0, units.numel())
+            )
             pending = self._pending_admission
             if pending is not None:
-                graph_map[:n_retained] = pending.previous_graph_indices[retained_graphs]
+                graph_map[retained_slots] = pending.previous_graph_indices[
+                    retained_graphs
+                ]
                 if group_map is not None and pending.previous_group_indices is not None:
-                    group_map[: units.numel()] = pending.previous_group_indices[units]
+                    group_map[retained_group_slots] = pending.previous_group_indices[
+                        units
+                    ]
             self._pending_admission = BatchAdmission(
                 previous_graph_indices=graph_map, previous_group_indices=group_map
             )
         self._admission_initialized = False
-        self._forces_primed = False
+        # Fused stages prime arrivals in their next shared evaluation. Retained
+        # paths already have valid forces and must not be evaluated twice.
+        if (
+            current is not None
+            and isinstance(self, FusedStage)
+            and self.by_group
+            and self._forces_primed
+        ):
+            current.reprime_pending.view(-1)[graph_map < 0] = True
+        else:
+            self._forces_primed = False
         self._last_converged = None
         for _, sub_stage in getattr(self, "sub_stages", []):
             sub_stage._last_converged = None
@@ -2786,6 +2826,8 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         remaining_indices: "torch.Tensor",
         n_new: int,
         template_batch: Batch,
+        *,
+        replacement_indices: torch.Tensor | None = None,
     ) -> None:
         """Synchronize ``self._state`` after active-batch membership changes.
 
@@ -2808,8 +2850,16 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         template_batch : Batch
             The updated batch (remaining + replacements); provides device
             and dtype for :meth:`_make_new_state`.
+        replacement_indices : torch.Tensor or None
+            Slots to reset in place in system-only state, instead of repacking.
         """
         if not hasattr(self, "_state"):
+            return
+
+        if replacement_indices is not None:
+            fresh = self._make_new_state(n_new, template_batch)
+            for key, value in self._state._storage.groups["system"].items():
+                value.index_copy_(0, replacement_indices, fresh[key])
             return
 
         if remaining_indices.numel() > 0:
@@ -3341,13 +3391,13 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         return batch
 
     def refill_check(self, batch: Batch, exit_status: int) -> Batch | None:
-        """Replace graduated samples via index-select and append.
+        """Replace graduated samples, reusing matching grouped slots when possible.
 
-        Graduated graphs (``status >= exit_status``) are written to sinks,
-        then removed via :meth:`Batch.index_select` on the remaining indices.
-        Replacement samples from the sampler are appended via
-        :meth:`Batch.append`.  Dynamics-specific bookkeeping fields are
-        written into the result batch via the ``_bookkeeping_keys`` registry.
+        Graduated graphs (``status >= exit_status``) are written to sinks.
+        Complete replacement paths with matching topology overwrite their slots.
+        Other replacements use :meth:`Batch.index_select` and :meth:`Batch.append`.
+        The ``_bookkeeping_keys`` registry initializes arrival bookkeeping while
+        preserving values for retained graphs.
 
         Grouped admission preserves complete paths and resident hook state.
         Paths awaiting downstream transmission remain active until copied.
@@ -3362,7 +3412,7 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         Returns
         -------
         Batch | None
-            A new batch with graduated graphs replaced by fresh samples,
+            The updated batch with graduated graphs replaced by fresh samples,
             or ``None`` if no active samples remain (sampler exhausted
             and all graduated) — in which case ``self.done`` is set to
             ``True``.
@@ -3436,6 +3486,40 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
         )
         if not graduated_mask.any() and not replacements:
             return batch
+        repl_batch = None
+        if self.by_group and replacements:
+            repl_batch = self.sampler._assemble_samples(
+                replacements, device=batch.device
+            )
+            self._initialize_arrivals(repl_batch, template=batch)
+            replaced_groups = layout.reduce_all(graduated_mask)
+            replacement_graphs = torch.where(graduated_mask)[0]
+            stages = (
+                [stage for _, stage in self.sub_stages]
+                if isinstance(self, FusedStage)
+                else [self]
+            )
+            # Segmented optimizer histories require the existing repacking path.
+            state_fits = all(
+                not hasattr(stage, "_state")
+                or set(stage._state._storage.groups) == {"system"}
+                for stage in stages
+            )
+            if (
+                state_fits
+                and torch.equal(
+                    layout.num_graphs_per_group[replaced_groups],
+                    repl_batch.group_layout.num_graphs_per_group,
+                )
+                and batch._replace_graphs(repl_batch, replacement_graphs)
+            ):
+                self._record_batch_change(
+                    batch,
+                    batch,
+                    remaining_indices,
+                    replacement_graphs=replacement_graphs,
+                )
+                return batch
         if n_remaining:
             result = (
                 batch.index_select_groups(layout.reduce_all(~graduated_mask))
@@ -3446,10 +3530,6 @@ class BaseDynamics(HookRegistryMixin, _CommunicationMixin):
             result = None
 
         if self.by_group and replacements:
-            repl_batch = self.sampler._assemble_samples(
-                replacements, device=batch.device
-            )
-            self._initialize_arrivals(repl_batch, template=batch)
             if result is None:
                 result = repl_batch
             else:
@@ -4414,6 +4494,8 @@ class FusedStage(BaseDynamics):
         remaining_indices: "torch.Tensor",
         n_new: int,
         template_batch: Batch,
+        *,
+        replacement_indices: torch.Tensor | None = None,
     ) -> None:
         """Fan out state sync to all sub-stages.
 
@@ -4430,9 +4512,19 @@ class FusedStage(BaseDynamics):
             Number of newly admitted replacement systems.
         template_batch : Batch
             The updated batch; provides device/dtype for new-state init.
+        replacement_indices : torch.Tensor or None
+            Slots to reset in place in each sub-stage's system-only state.
         """
         for _, sub_stage in self.sub_stages:
-            sub_stage._sync_state_to_batch(remaining_indices, n_new, template_batch)
+            if replacement_indices is None:
+                sub_stage._sync_state_to_batch(remaining_indices, n_new, template_batch)
+            else:
+                sub_stage._sync_state_to_batch(
+                    remaining_indices,
+                    n_new,
+                    template_batch,
+                    replacement_indices=replacement_indices,
+                )
 
     def _ensure_bookkeeping_fields(self, batch: Batch) -> None:
         """Auto-initialize status and registered bookkeeping fields if absent.

@@ -1743,6 +1743,57 @@ class Batch(DataMixin):
             data_class=self._data_class,
         )
 
+    def _replace_graphs(self, source: Batch, indices: Tensor) -> bool:
+        """Overwrite matching packed slots, leaving all resident storage intact.
+
+        Return False without mutation when topology or schemas require repacking.
+        The caller supplies complete groups with matching image counts.
+        """
+        if (
+            source.device != self.device
+            or source.num_graphs != indices.numel()
+            or self._storage.groups.keys() != source._storage.groups.keys()
+            or not self._storage.groups.keys() <= _BUILTIN_LEVELS
+            or "neighbor_matrix" in self
+        ):
+            return False
+        for name, target in self._storage.groups.items():
+            incoming = source._storage.groups[name]
+            if type(target) is not type(incoming) or set(target.keys()) != set(
+                incoming.keys()
+            ):
+                return False
+            if isinstance(target, SegmentedLevelStorage) and not torch.equal(
+                target.segment_lengths[indices], incoming.segment_lengths
+            ):
+                return False
+            for key, value in target.items():
+                other = incoming[key]
+                if value.dtype != other.dtype or value.shape[1:] != other.shape[1:]:
+                    return False
+
+        for name, target in self._storage.groups.items():
+            incoming = source._storage.groups[name]
+            rows = indices
+            if isinstance(target, SegmentedLevelStorage):
+                owners = incoming.batch_idx.long()
+                rows = (
+                    target.batch_ptr[indices][owners]
+                    + torch.arange(incoming.num_elements(), device=self.device)
+                    - incoming.batch_ptr[owners]
+                ).long()
+            for key, value in target.items():
+                if key == "group_idx":
+                    continue  # Local group labels and their cached layout stay valid.
+                payload = incoming[key]
+                if name == "edges" and key in _INDEX_KEYS:
+                    correction = (
+                        self.batch_ptr[indices][owners] - source.batch_ptr[owners]
+                    )
+                    payload = payload + correction.unsqueeze(-1)
+                value.index_copy_(0, rows, payload)
+        return True
+
     def index_select_groups(self, idx: Tensor | Sequence[int]) -> Batch:
         """Select complete groups in order and normalize their local labels.
 
