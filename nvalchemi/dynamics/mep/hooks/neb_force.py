@@ -177,6 +177,7 @@ class NEBForceHook:
         method: str | NEBMethod | TorchNEBMethod = "improved_tangent",
         endpoint_mode: Literal["fixed", "relaxed"] = "fixed",
         fixed_atom_indices: Mapping[int, Sequence[int]] | None = None,
+        fixed_atom_mask_key: str | None = None,
     ) -> None:
         """Initialize the NEB force hook.
 
@@ -257,6 +258,10 @@ class NEBForceHook:
         self.method_key = method_key
         self.endpoint_mode = endpoint_mode
         self.fixed_atom_indices = fixed_atom_indices
+        if fixed_atom_mask_key is not None and fixed_atom_indices is not None:
+            raise ValueError("Use either fixed_atom_mask_key or fixed_atom_indices")
+        self.fixed_atom_mask_key = fixed_atom_mask_key
+        self._link_ptr: Tensor | None = None
         self._workspace: _NEBWorkspace | None = None
 
     def on_register(self, workflow: object) -> None:
@@ -316,6 +321,24 @@ class NEBForceHook:
         batch = ctx.batch
         validate_paths(batch)
         layout = batch.group_layout
+        old_workspace = self._workspace
+        old_link_ptr = self._link_ptr
+        admission = ctx.admission
+        admitted = (
+            admission.admitted_mask
+            if admission is not None
+            else torch.ones(batch.num_graphs, dtype=torch.bool, device=batch.device)
+        )
+        admitted_nodes = admitted[batch.batch_idx.long()]
+        workflow = ctx.workflow
+        if (
+            self.fixed_atom_indices is not None
+            and workflow is not None
+            and (workflow.sampler is not None or workflow.has_neighbor)
+        ):
+            raise ValueError(
+                "Streaming NEB requires fixed_atom_mask_key instead of fixed_atom_indices"
+            )
         dtype = batch.positions.dtype
         device = batch.device
 
@@ -336,6 +359,15 @@ class NEBForceHook:
             dtype=torch.bool,
             device=device,
         )
+        if self.fixed_atom_mask_key is not None:
+            supplied = getattr(batch, self.fixed_atom_mask_key, None)
+            if (
+                not isinstance(supplied, Tensor)
+                or supplied.shape != (batch.num_nodes,)
+                or supplied.dtype != torch.bool
+            ):
+                raise ValueError("fixed_atom_mask_key must name a boolean node mask")
+            fixed_atoms.copy_(supplied)
         if self.fixed_atom_indices is not None:
             num_nodes_per_image = batch.num_nodes_per_graph
             for path_index, atom_indices in self.fixed_atom_indices.items():
@@ -358,6 +390,12 @@ class NEBForceHook:
                     fixed_atoms[image_starts + atom_index] = True
         if self.endpoint_mode == "fixed":
             fixed_atoms[is_endpoint[batch.batch_idx.long()]] = True
+        if "force_mode" in batch:
+            force_mode = torch.where(admitted, force_mode, batch.force_mode)
+        if "neb_fixed_node_mask" in batch:
+            fixed_atoms = torch.where(
+                admitted_nodes, fixed_atoms, batch.neb_fixed_node_mask
+            )
 
         # `validate_paths` guarantees cell and PBC consistency within each path,
         # so the kernels only need the first image's geometry. Missing cells use
@@ -414,13 +452,21 @@ class NEBForceHook:
         set_batch_field("force_mode", force_mode, "system")
         set_batch_field(
             "physical_forces",
-            torch.zeros_like(batch.positions),
+            (
+                torch.where(admitted_nodes.unsqueeze(-1), 0, batch.physical_forces)
+                if "physical_forces" in batch
+                else torch.zeros_like(batch.positions)
+            ),
             "node",
         )
         set_batch_field("neb_fixed_node_mask", fixed_atoms, "node")
         set_batch_field(
             "forward_link_length",
-            torch.zeros(batch.num_graphs, dtype=dtype, device=device),
+            (
+                torch.where(admitted, 0, batch.forward_link_length)
+                if "forward_link_length" in batch
+                else torch.zeros(batch.num_graphs, dtype=dtype, device=device)
+            ),
             "system",
         )
 
@@ -447,6 +493,26 @@ class NEBForceHook:
         )
 
         self._refresh_spring_constants(ctx, DynamicsStage.ON_ADMISSION)
+        self._link_ptr = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=device),
+                (layout.num_graphs_per_group - 1).cumsum(0),
+            ]
+        )
+        if (
+            admission is not None
+            and admission.previous_group_indices is not None
+            and old_workspace is not None
+            and old_link_ptr is not None
+            and self.spring.refresh == DynamicsStage.ON_ADMISSION
+        ):
+            for new, old in enumerate(admission.previous_group_indices.tolist()):
+                if old >= 0:
+                    start, end = self._link_ptr[new : new + 2].tolist()
+                    old_start, old_end = old_link_ptr[old : old + 2].tolist()
+                    spring_constants[start:end].copy_(
+                        old_workspace.spring_constants[old_start:old_end]
+                    )
 
     def __call__(self, ctx: DynamicsContext, stage: DynamicsStage) -> None:
         """Prepare NEB state or construct NEB forces.

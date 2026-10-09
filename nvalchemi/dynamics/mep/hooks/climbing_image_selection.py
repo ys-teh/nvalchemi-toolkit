@@ -141,11 +141,16 @@ class ClimbingImageSelectionHook:
                 # In :class:`~nvalchemi.dynamics.FusedStage`, paths may become active on
                 # different iterations. Track initialization per graph, while grouped dynamics
                 # keeps this mask uniform within each path, avoiding a reduction and rebroadcast.
-                self._initialized_graphs = torch.zeros(
+                initialized = torch.zeros(
                     ctx.batch.num_graphs,
                     dtype=torch.bool,
                     device=ctx.batch.device,
                 )
+                if ctx.admission is not None and self._initialized_graphs is not None:
+                    mapping = ctx.admission.previous_graph_indices
+                    retained = mapping >= 0
+                    initialized[retained] = self._initialized_graphs[mapping[retained]]
+                self._initialized_graphs = initialized
             return
         if stage != DynamicsStage.AFTER_COMPUTE:
             return

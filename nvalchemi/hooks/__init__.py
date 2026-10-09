@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from nvalchemi.hooks._context import (
+    BatchAdmission,
     BiasContext,
     DynamicsContext,
     GenerationContext,
@@ -53,6 +54,7 @@ from nvalchemi.hooks.reporting import (
 from nvalchemi.hooks.stage_timing import StageTimingHook
 
 __all__ = [
+    "BatchAdmission",
     "BaseRichLayout",
     "BiasContext",
     "BiasedPotentialHook",

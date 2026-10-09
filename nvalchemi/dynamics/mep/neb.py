@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -34,6 +35,8 @@ from pydantic import (
 from nvalchemi._serialization import SerializableClass
 from nvalchemi.dynamics.base import (
     BaseDynamics,
+    BufferConfig,
+    CommMode,
     ConvergenceHook,
     DynamicsStage,
     FusedStage,
@@ -61,6 +64,8 @@ from nvalchemi.dynamics.strategy import (
 from nvalchemi.hooks import Hook
 
 if TYPE_CHECKING:
+    from nvalchemi.dynamics.sampler import SizeAwareSampler
+    from nvalchemi.dynamics.sinks import DataSink
     from nvalchemi.models.base import BaseModelMixin
 
 __all__ = ["ClimbingImageConfig", "NEB"]
@@ -229,6 +234,10 @@ class NEB(DynamicsStrategy):
             "Mapping from path indices to atom indices held fixed in every image "
             "of that path."
         ),
+    )
+    fixed_atom_mask_key: str | None = Field(
+        default=None,
+        description="Node boolean mask carried by each path for streamed atom constraints.",
     )
     diagnostics_log_path: Path | None = Field(
         default=None,
@@ -522,9 +531,14 @@ class NEB(DynamicsStrategy):
                 method=self.method,
                 endpoint_mode=self.endpoint_mode,
                 fixed_atom_indices=self.fixed_atom_indices,
+                fixed_atom_mask_key=self.fixed_atom_mask_key,
             )
         )
-        if self.endpoint_mode == "fixed" or self.fixed_atom_indices:
+        if (
+            self.endpoint_mode == "fixed"
+            or self.fixed_atom_indices
+            or self.fixed_atom_mask_key
+        ):
             hooks.append(
                 FreezeAtomsHook(
                     mask_key="neb_fixed_node_mask",
@@ -570,8 +584,36 @@ class NEB(DynamicsStrategy):
             )
         return hooks
 
-    def build_engine(self) -> FusedStage:
+    def build_engine(
+        self,
+        *,
+        sampler: SizeAwareSampler | None = None,
+        refill_frequency: int = 1,
+        sinks: Sequence[DataSink] | None = None,
+        overflow_sinks: Sequence[DataSink] | None = None,
+        buffer_config: BufferConfig | None = None,
+        max_batch_size: int = sys.maxsize,
+        comm_mode: CommMode = "async_recv",
+    ) -> FusedStage:
         """Construct a fresh fused optimizer.
+
+        Parameters
+        ----------
+        sampler : SizeAwareSampler or None
+            Grouped prepared-band sampler. None disables streaming refill.
+        refill_frequency : int
+            Number of steps between sampler refill checks.
+        sinks : sequence of DataSink or None
+            Graduated results.
+        overflow_sinks : sequence of DataSink or None
+            Separate storage for pending pipeline arrivals. None uses no overflow
+            storage, so full active batches raise instead of draining results.
+        buffer_config : BufferConfig or None
+            Image, atom, and edge capacities for pipeline communication.
+        max_batch_size : int
+            Maximum active images. The sampler may impose a tighter image limit.
+        comm_mode : CommMode
+            Pipeline communication mode.
 
         Returns
         -------
@@ -655,7 +697,47 @@ class NEB(DynamicsStrategy):
             compile_step=self.compile,
             compile_kwargs=dict(self.compile_kwargs),
             device_type=stages[0][1].device_type,
+            sampler=sampler,
+            refill_frequency=refill_frequency,
+            sinks=sinks,
+            buffer_config=buffer_config,
+            overflow_sinks=[] if overflow_sinks is None else overflow_sinks,
+            max_batch_size=max_batch_size,
+            comm_mode=comm_mode,
         )
+
+    def run_stream(
+        self,
+        sampler: SizeAwareSampler,
+        sinks: Sequence[DataSink],
+        *,
+        refill_frequency: int = 1,
+        max_batch_size: int = sys.maxsize,
+    ) -> None:
+        """Optimize every prepared path from *sampler* with in-flight refill.
+
+        Completed paths are written to *sinks* and freed slots are refilled
+        from *sampler* until it is exhausted. Each call builds a fresh engine,
+        regardless of ``cache_engine``. To scale across GPUs, give each rank
+        its own sampler over a disjoint subset of paths.
+
+        Parameters
+        ----------
+        sampler : SizeAwareSampler
+            Grouped prepared-band sampler (``by_group=True``).
+        sinks : sequence of DataSink
+            Storage for completed paths, tried in order.
+        refill_frequency : int
+            Number of steps between sampler refill checks.
+        max_batch_size : int
+            Maximum active images. The sampler may impose a tighter image limit.
+        """
+        self.build_engine(
+            sampler=sampler,
+            sinks=sinks,
+            refill_frequency=refill_frequency,
+            max_batch_size=max_batch_size,
+        ).run()
 
     def to_spec_dict(self) -> dict[str, Any]:
         """Serialize NEB configuration and convergence hooks."""

@@ -60,7 +60,7 @@ class SizeAwareSampler(Sampler[int]):
         Maximum total edges across all samples in a batch. ``None`` disables
         the edge count constraint.
     max_batch_size : int | None
-        Maximum number of samples (graphs) in a batch. ``None`` disables the
+        Maximum number of graphs in a batch. ``None`` disables the
         graph-count constraint, letting ``max_atoms`` (and/or ``max_edges``)
         alone control batch capacity. At least one of ``max_atoms`` or
         ``max_batch_size`` must be set.
@@ -72,6 +72,9 @@ class SizeAwareSampler(Sampler[int]):
         Fraction of GPU memory to use when estimating atom capacity. Default
         0.8 (80%), leaving 20% headroom for model parameters and CUDA context.
         Only used when CUDA is available.
+    by_group : bool
+        Sample complete single-group batches. ``max_batch_size`` counts graphs
+        across all groups.
 
     Raises
     ------
@@ -100,6 +103,8 @@ class SizeAwareSampler(Sampler[int]):
         bin_width: int = 1,
         shuffle: bool = False,
         max_gpu_memory_fraction: float = 0.8,
+        *,
+        by_group: bool = False,
     ) -> None:
         """Initialize the size-aware sampler.
 
@@ -116,7 +121,7 @@ class SizeAwareSampler(Sampler[int]):
             Maximum total edges across all samples in a batch. ``None`` disables
             the edge count constraint.
         max_batch_size : int | None
-            Maximum number of samples (graphs) in a batch. ``None`` disables
+            Maximum number of graphs in a batch. ``None`` disables
             the graph-count constraint. At least one of ``max_atoms`` or
             ``max_batch_size`` must be set.
         bin_width : int
@@ -127,6 +132,10 @@ class SizeAwareSampler(Sampler[int]):
             Fraction of GPU memory to use when estimating atom capacity. Default
             0.8 (80%), leaving 20% headroom for model parameters and CUDA context.
             Only used when CUDA is available.
+        by_group : bool, optional
+            Sample complete single-group batches instead of AtomicData graphs.
+            Metadata contains total atom and edge counts across each group.
+            ``max_batch_size`` counts graphs across all groups. Default False.
 
         Raises
         ------
@@ -165,6 +174,11 @@ class SizeAwareSampler(Sampler[int]):
         self._max_atoms = max_atoms
         self._max_edges = max_edges
         self._max_batch_size = max_batch_size
+        self.by_group = by_group
+        self._load_sample = self._load_group if by_group else self._load_graph
+        self._assemble_samples = (
+            self._assemble_groups if by_group else Batch.from_data_list
+        )
         self._bin_width = bin_width
         self._shuffle = shuffle
         self._max_gpu_memory_fraction = max_gpu_memory_fraction
@@ -258,6 +272,54 @@ class SizeAwareSampler(Sampler[int]):
 
         return max(available_for_data // bytes_per_atom, 1)
 
+    def _load_graph(self, index: int, max_count: int | None = None) -> AtomicData:
+        """Load and identify one ordinary graph."""
+        data, _ = self._dataset[index]
+        data.add_system_property(
+            "system_id", torch.tensor([[self._next_system_id]], dtype=torch.long)
+        )
+        self._next_system_id += 1
+        return data
+
+    def _load_group(self, index: int, max_count: int | None = None) -> Batch | None:
+        """Load and identify a complete group if it fits the remaining graph budget."""
+        data, _ = self._dataset[index]
+        if self._max_batch_size is not None and data.num_graphs > self._max_batch_size:
+            raise RuntimeError(
+                f"Sample {index} exceeds max_batch_size={self._max_batch_size}"
+            )
+        if max_count is not None and data.num_graphs > max_count:
+            return None
+        data.add_key(
+            "group_id",
+            [torch.tensor([[index]], dtype=torch.long, device=data.device)]
+            * data.num_graphs,
+            level="system",
+            overwrite=True,
+        )
+        data.add_key(
+            "system_id",
+            [
+                torch.tensor([[i]], dtype=torch.long, device=data.device)
+                for i in range(
+                    self._next_system_id, self._next_system_id + data.num_graphs
+                )
+            ],
+            level="system",
+            overwrite=True,
+        )
+        self._next_system_id += data.num_graphs
+        return data
+
+    @staticmethod
+    def _assemble_groups(samples: list[Batch], device: torch.device | str) -> Batch:
+        """Append complete grouped batches and build their final layout once."""
+        batch = samples[0].to(device)
+        for sample in samples[1:]:
+            batch.append(sample.to(device))
+        batch.group_layout
+        return batch
+
     def build_initial_batch(self) -> Batch:
         """Build an initial batch using diverse round-robin bin packing.
 
@@ -291,19 +353,20 @@ class SizeAwareSampler(Sampler[int]):
             self._max_batch_size if self._max_batch_size is not None else float("inf")
         )
 
-        data_list: list[AtomicData] = []
+        data_list: list[AtomicData | Batch] = []
         total_atoms = 0
         total_edges = 0
+        total_graphs = 0
 
         # Round-robin across bins for diverse size distribution.
         active_bins = sorted(self._bins.keys())
 
-        while active_bins and len(data_list) < effective_max_batch:
+        while active_bins and total_graphs < effective_max_batch:
             next_round_bins: list[int] = []
             added_this_round = False
 
             for bin_key in active_bins:
-                if len(data_list) >= effective_max_batch:
+                if total_graphs >= effective_max_batch:
                     break
 
                 bin_deque = self._bins[bin_key]
@@ -329,17 +392,23 @@ class SizeAwareSampler(Sampler[int]):
                         and total_edges + num_edges > self._max_edges
                     ):
                         continue
-
-                    # Sample fits — load it.
-                    data, _ = self._dataset[idx]
-                    data.add_system_property(
-                        "system_id",
-                        torch.tensor([[self._next_system_id]], dtype=torch.long),
+                    # Atoms/edges fit by metadata; load the sample, which returns
+                    # None if its graph count exceeds the remaining budget.
+                    data = self._load_sample(
+                        idx,
+                        max_count=(
+                            self._max_batch_size - total_graphs
+                            if self._max_batch_size is not None
+                            else None
+                        ),
                     )
-                    self._next_system_id += 1
+                    if data is None:
+                        continue
+                    num_graphs = data.num_graphs if self.by_group else 1
                     data_list.append(data)
                     total_atoms += num_atoms
                     total_edges += num_edges
+                    total_graphs += num_graphs
                     self._consumed.add(idx)
                     added_this_round = True
                     break
@@ -349,7 +418,7 @@ class SizeAwareSampler(Sampler[int]):
                     next_round_bins.append(bin_key)
 
             # If no sample was added in a full round, budget is saturated.
-            if not added_this_round or len(data_list) >= effective_max_batch:
+            if not added_this_round or total_graphs >= effective_max_batch:
                 break
             active_bins = next_round_bins
 
@@ -359,7 +428,7 @@ class SizeAwareSampler(Sampler[int]):
             )
 
         # Create batch
-        batch = Batch.from_data_list(data_list, device=data_list[0].device)
+        batch = self._assemble_samples(data_list, device=data_list[0].device)
 
         # Initialize status attribute
         batch["status"] = torch.zeros(
@@ -368,7 +437,9 @@ class SizeAwareSampler(Sampler[int]):
 
         return batch
 
-    def request_replacement(self, num_atoms: int, num_edges: int) -> AtomicData | None:
+    def request_replacement(
+        self, num_atoms: int, num_edges: int
+    ) -> AtomicData | Batch | None:
         """Request a replacement sample that fits within the given constraints.
 
         Searches for an unconsumed sample with at most ``num_atoms`` atoms and
@@ -409,12 +480,7 @@ class SizeAwareSampler(Sampler[int]):
                 # Check if candidate fits in the slot
                 if cand_atoms <= num_atoms and cand_edges <= num_edges:
                     # Found a match, load and mark consumed
-                    data, _ = self._dataset[idx]
-                    data.add_system_property(
-                        "system_id",
-                        torch.tensor([[self._next_system_id]], dtype=torch.long),
-                    )
-                    self._next_system_id += 1
+                    data = self._load_sample(idx)
                     self._consumed.add(idx)
                     return data
 
@@ -425,7 +491,7 @@ class SizeAwareSampler(Sampler[int]):
         atom_budget: int | None = None,
         edge_budget: int | None = None,
         max_count: int | None = None,
-    ) -> list[AtomicData]:
+    ) -> list[AtomicData | Batch]:
         """Request replacement samples that fit within a total atom/edge budget.
 
         Searches bins from **largest to smallest** to maximize diversity —
@@ -440,7 +506,8 @@ class SizeAwareSampler(Sampler[int]):
         edge_budget : int | None
             Total edges available for replacements.  ``None`` = unconstrained.
         max_count : int | None
-            Maximum number of replacement samples.  ``None`` = unconstrained.
+            Maximum total replacement graphs/images. Complete groups must fit
+            this budget. ``None`` = unconstrained.
 
         Returns
         -------
@@ -448,13 +515,14 @@ class SizeAwareSampler(Sampler[int]):
             Replacement samples (may be empty if nothing fits or sampler
             is exhausted).
         """
-        results: list[AtomicData] = []
+        results: list[AtomicData | Batch] = []
         remaining_atoms = atom_budget
         remaining_edges = edge_budget
+        remaining_graphs = max_count
 
         # Iterate bins from largest to smallest for diversity.
         for bin_key in sorted(self._bins.keys(), reverse=True):
-            if max_count is not None and len(results) >= max_count:
+            if remaining_graphs is not None and remaining_graphs <= 0:
                 break
 
             bin_deque = self._bins[bin_key]
@@ -463,7 +531,7 @@ class SizeAwareSampler(Sampler[int]):
                 bin_deque.popleft()
 
             for idx in list(bin_deque):
-                if max_count is not None and len(results) >= max_count:
+                if remaining_graphs is not None and remaining_graphs <= 0:
                     break
                 if idx in self._consumed:
                     continue
@@ -474,14 +542,10 @@ class SizeAwareSampler(Sampler[int]):
                     continue
                 if remaining_edges is not None and cand_edges > remaining_edges:
                     continue
-
-                # Fits — load and consume.
-                data, _ = self._dataset[idx]
-                data.add_system_property(
-                    "system_id",
-                    torch.tensor([[self._next_system_id]], dtype=torch.long),
-                )
-                self._next_system_id += 1
+                data = self._load_sample(idx, max_count=remaining_graphs)
+                if data is None:
+                    continue
+                cand_graphs = data.num_graphs if self.by_group else 1
                 self._consumed.add(idx)
                 results.append(data)
 
@@ -489,6 +553,8 @@ class SizeAwareSampler(Sampler[int]):
                     remaining_atoms -= cand_atoms
                 if remaining_edges is not None:
                     remaining_edges -= cand_edges
+                if remaining_graphs is not None:
+                    remaining_graphs -= cand_graphs
 
         return results
 
@@ -504,7 +570,7 @@ class SizeAwareSampler(Sampler[int]):
 
     @property
     def max_batch_size(self) -> int | None:
-        """Maximum number of systems per batch (user-specified constraint)."""
+        """Maximum total graphs/images per batch (user-specified constraint)."""
         return self._max_batch_size
 
     @property
@@ -550,7 +616,7 @@ class SizeAwareSampler(Sampler[int]):
         self,
         node_counts: torch.Tensor,
         edge_counts: torch.Tensor,
-    ) -> list[AtomicData | None]:
+    ) -> list[AtomicData | Batch | None]:
         """Request replacement samples for multiple graduated systems using GPU-native constraint checking.
 
         Eliminates the ``.tolist()`` D→H syncs from ``_refill_check``. Constraint
@@ -589,7 +655,7 @@ class SizeAwareSampler(Sampler[int]):
             & ~self._consumed_mask.unsqueeze(0)  # not yet consumed
         )  # (M, N) bool, computed on GPU
 
-        results: list[AtomicData | None] = []
+        results: list[AtomicData | Batch | None] = []
         available = ~self._consumed_mask.clone()  # (N,) running availability
 
         for i in range(M):
@@ -603,16 +669,11 @@ class SizeAwareSampler(Sampler[int]):
 
             # ONE item() per slot — unavoidable to index into the Python dataset
             chosen_idx = int(candidates[0, 0].item())
+            data = self._load_sample(chosen_idx)
             available[chosen_idx] = False
             self._consumed_mask[chosen_idx] = True
             # Sync CPU _consumed set for exhausted() and __len__ correctness
             self._consumed.add(chosen_idx)
-
-            data, _ = self._dataset[chosen_idx]
-            data.add_system_property(
-                "system_id", torch.tensor([[self._next_system_id]], dtype=torch.long)
-            )
-            self._next_system_id += 1
             results.append(data)
 
         return results

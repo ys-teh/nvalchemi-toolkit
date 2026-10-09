@@ -59,6 +59,28 @@ class HookContext:
     workflow: Any = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class BatchAdmission:
+    """Map current membership to the last hook admission.
+
+    Attributes
+    ----------
+    previous_graph_indices : torch.Tensor
+        One old graph index per current graph, with -1 for arrivals.
+    previous_group_indices : torch.Tensor or None
+        One old group index per current group, with -1 for arrivals.
+        None for ungrouped dynamics.
+    """
+
+    previous_graph_indices: torch.Tensor
+    previous_group_indices: torch.Tensor | None = None
+
+    @property
+    def admitted_mask(self) -> torch.Tensor:
+        """Graph mask selecting new arrivals independently of active status."""
+        return self.previous_graph_indices < 0
+
+
 @dataclass(kw_only=True)
 class DynamicsContext(HookContext):
     """Context object passed to dynamics hooks.
@@ -80,12 +102,15 @@ class DynamicsContext(HookContext):
         that graduated during the current step, meaning their status reached
         the engine's ``exit_status``. Set only for ``ON_GRADUATE`` dispatches,
         where it may be all ``False``; ``None`` at every other stage.
+    admission : BatchAdmission or None
+        Membership mappings, populated only during ON_ADMISSION.
     """
 
     step_count: int = 0
     converged_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
     active_graph_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
     graduated_mask: Bool[torch.Tensor, "B"] | None = None  # noqa: F722, F821
+    admission: BatchAdmission | None = None
 
 
 @dataclass(kw_only=True)

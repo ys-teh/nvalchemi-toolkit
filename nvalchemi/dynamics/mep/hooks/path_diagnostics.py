@@ -177,6 +177,7 @@ class PathDiagnosticsHook:
         dtype = batch.positions.dtype
         device = batch.positions.device
 
+        previous = self._diagnostics
         self._diagnostics = PathDiagnostics(
             fmax=torch.full((num_paths,), torch.nan, dtype=dtype, device=device),
             energy_barrier=torch.full(
@@ -201,6 +202,19 @@ class PathDiagnosticsHook:
         self._candidate_highest_interior_image_idx = torch.empty(
             num_paths, dtype=torch.int32, device=device
         )
+        if previous is not None and ctx.admission is not None:
+            mapping = ctx.admission.previous_group_indices
+            if mapping is not None:
+                retained = mapping >= 0
+                for key in (
+                    "fmax",
+                    "energy_barrier",
+                    "highest_interior_image_idx",
+                    "path_length",
+                ):
+                    getattr(self._diagnostics, key)[retained] = getattr(previous, key)[
+                        mapping[retained]
+                    ]
 
     def get_diagnostics(self) -> PathDiagnostics:
         """Return diagnostics refreshed for the current path evaluation.
