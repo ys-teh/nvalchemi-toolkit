@@ -264,7 +264,9 @@ several helper methods for routing data between buffers:
 
 - **_recv_to_batch(incoming)**: Drains waiting overflow samples first,
   then stages new data through the recv buffer into the active batch
-  via ``_buffer_to_batch`` and zeros the recv buffer.
+  via ``_buffer_to_batch`` and zeros the recv buffer. When the active
+  batch is full, new arrivals go directly to overflow storage without
+  the extra receive-buffer copy.
 
 - **_buffer_to_batch(incoming)**: Routes incoming data into the active
   batch.  Admitted graphs are copied out of the buffer with

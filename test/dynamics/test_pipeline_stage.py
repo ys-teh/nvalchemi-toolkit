@@ -2033,10 +2033,17 @@ class TestOverflowDrainBack:
         handle = Mock()
         handle.wait.return_value = incoming
 
-        with patch.object(Batch, "irecv", return_value=handle):
+        with (
+            patch.object(Batch, "irecv", return_value=handle),
+            patch.object(Batch, "put", autospec=True, side_effect=Batch.put) as put,
+        ):
             stage._prestep_sync_buffers()
             stage._complete_pending_recv()
 
+        if recv_buffer_exists and max_batch_size == 4:
+            put.assert_called_once()
+        else:
+            put.assert_not_called()
         assert stage.active_batch.system_id.view(-1).tolist() == list(
             range(max_batch_size)
         )

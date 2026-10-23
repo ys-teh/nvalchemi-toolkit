@@ -1264,11 +1264,11 @@ class _CommunicationMixin:
 
         Waiting overflow samples are admitted before newly received samples.
 
-        When ``recv_buffer`` is available, copies *incoming* data into the
-        pre-allocated receive buffer via :meth:`Batch.put`, then routes the
-        buffer contents into the active batch via :meth:`_buffer_to_batch`.
-        When ``recv_buffer`` is ``None``, falls back to routing *incoming*
-        directly.
+        When ``recv_buffer`` is available and the active batch has room,
+        copies *incoming* data into the receive buffer via :meth:`Batch.put`,
+        then routes its contents via :meth:`_buffer_to_batch`. Otherwise,
+        routes *incoming* directly, avoiding a staging copy when every
+        arrival must wait in overflow.
 
         Parameters
         ----------
@@ -1280,7 +1280,11 @@ class _CommunicationMixin:
         if incoming.num_graphs > 0:
             self._on_receive(incoming)
         self._drain_sinks_to_batch()
-        if self.recv_buffer is not None and incoming.num_graphs > 0:
+        if (
+            self.recv_buffer is not None
+            and incoming.num_graphs > 0
+            and self.room_in_active_batch > 0
+        ):
             mask = torch.ones(incoming.num_graphs, dtype=torch.bool, device=self.device)
             self.recv_buffer.put(incoming, mask=mask)
             self._buffer_to_batch(self.recv_buffer)
