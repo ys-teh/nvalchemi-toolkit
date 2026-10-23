@@ -181,9 +181,10 @@ to coordinate data flow between ranks:
    correct buffer shapes).  In sync mode the receive completes inline;
    in async modes the handle is stored for later completion.
 
-2. **_complete_pending_recv()**: Waits on the deferred receive, routes
-   data through the recv buffer into the active batch, and drains
-   overflow sinks to backfill any available capacity.
+2. **_complete_pending_recv()**: Waits on the deferred receive, drains
+   waiting overflow samples into the active batch, then admits newly
+   received data into any remaining capacity. Sync receives use the
+   same admission order inside ``_prestep_sync_buffers()``.
 
 3. **step()**: The dynamics integration step (forward pass, pre_update,
    post_update, convergence check).
@@ -261,9 +262,9 @@ Data routing helpers
 The :class:`~nvalchemi.dynamics.base._CommunicationMixin` provides
 several helper methods for routing data between buffers:
 
-- **_recv_to_batch(incoming)**: Stages data through the recv buffer
-  into the active batch via ``_buffer_to_batch``, then zeros the
-  recv buffer.
+- **_recv_to_batch(incoming)**: Drains waiting overflow samples first,
+  then stages new data through the recv buffer into the active batch
+  via ``_buffer_to_batch`` and zeros the recv buffer.
 
 - **_buffer_to_batch(incoming)**: Routes incoming data into the active
   batch.  Admitted graphs are copied out of the buffer with

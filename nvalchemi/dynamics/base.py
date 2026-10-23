@@ -1262,6 +1262,8 @@ class _CommunicationMixin:
     def _recv_to_batch(self, incoming: Batch) -> None:
         """Stage incoming data through the recv buffer into the active batch.
 
+        Waiting overflow samples are admitted before newly received samples.
+
         When ``recv_buffer`` is available, copies *incoming* data into the
         pre-allocated receive buffer via :meth:`Batch.put`, then routes the
         buffer contents into the active batch via :meth:`_buffer_to_batch`.
@@ -1277,6 +1279,7 @@ class _CommunicationMixin:
             self._recv_template = incoming
         if incoming.num_graphs > 0:
             self._on_receive(incoming)
+        self._drain_sinks_to_batch()
         if self.recv_buffer is not None and incoming.num_graphs > 0:
             mask = torch.ones(incoming.num_graphs, dtype=torch.bool, device=self.device)
             self.recv_buffer.put(incoming, mask=mask)
@@ -1439,9 +1442,8 @@ class _CommunicationMixin:
 
         Notes
         -----
-        Called by ``_prestep_sync_buffers`` after processing incoming
-        data from the prior rank, to backfill any remaining capacity
-        with previously overflowed samples.
+        Called before newly received samples are admitted, or directly
+        when no receive is pending.
         """
         for sink in self.overflow_sinks:
             if self.room_in_active_batch <= 0:
@@ -1476,9 +1478,8 @@ class _CommunicationMixin:
         previous iteration is drained (awaited) at the top of this
         method before posting the new receive.
 
-        After processing incoming data (or when there is no prior rank),
-        any remaining capacity in the active batch is backfilled from
-        overflow sinks via :meth:`_drain_sinks_to_batch`.
+        Waiting overflow samples are admitted before newly received data.
+        With no prior rank, overflow sinks are drained directly.
 
         Notes
         -----
@@ -1529,23 +1530,21 @@ class _CommunicationMixin:
             else:
                 self._pending_recv_handle = handle
 
-        # In async modes, drain happens in _complete_pending_recv after recv.
-        if self.comm_mode == "sync" or self.prior_rank is None:
+        if self.prior_rank is None:
             self._drain_sinks_to_batch()
 
     def _complete_pending_recv(self) -> None:
         """Finalize any deferred receive before compute needs the data.
 
-        In ``"sync"`` mode this is a no-op because
-        ``_prestep_sync_buffers`` already completed the receive inline.
+        In ``"sync"`` mode, ``_prestep_sync_buffers`` already completed
+        the receive inline.
         In ``"async_recv"`` and ``"fully_async"`` modes, this method
         calls ``wait()`` on the stored receive handle and stages the
         incoming batch through the receive buffer (if present) into the
         active batch via :meth:`_recv_to_batch`.
 
-        After processing incoming data, any remaining capacity in the
-        active batch is backfilled from overflow sinks via
-        :meth:`_drain_sinks_to_batch`.
+        Waiting overflow samples are admitted before newly received data.
+        With no pending receive, overflow sinks are drained directly.
 
         Notes
         -----
@@ -1566,7 +1565,8 @@ class _CommunicationMixin:
                 )
             self._recv_to_batch(incoming)
             self._pending_recv_handle = None
-        self._drain_sinks_to_batch()
+        else:
+            self._drain_sinks_to_batch()
 
     def _manage_send_handle(self, handle: Any) -> None:
         """Store or wait on a send handle based on communication mode.
