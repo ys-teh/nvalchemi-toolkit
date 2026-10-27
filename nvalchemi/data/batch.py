@@ -1908,21 +1908,34 @@ class Batch(DataMixin):
             index_keys = _INDEX_KEYS.intersection(src_edges.keys(), dest_edges.keys())
             new_graphs = slice(num_dest_graphs, len(dest_atoms))
             if index_keys and new_graphs.stop > new_graphs.start:
-                shift = (
-                    dest_atoms._batch_ptr[new_graphs]
-                    - src_atoms._batch_ptr[:n][fit_mask]
-                )
-                start, end = dest_edges._batch_ptr[
-                    [new_graphs.start, new_graphs.stop]
-                ].tolist()
-                edge_shift = torch.repeat_interleave(
-                    shift,
-                    dest_edges.segment_lengths[new_graphs],
-                    output_size=end - start,
-                ).unsqueeze(1)
+                graph_count = new_graphs.stop
+                atom_ptr = dest_atoms._batch_ptr[: graph_count + 1]
+                edge_ptr = dest_edges._batch_ptr[: graph_count + 1]
+                # Invert the fit mask without a device-dependent output size.
+                # Existing graphs' offsets are ignored by the appended mask.
+                selected_rank = fit_mask.to(torch.int64).cumsum(0)
+                graph = torch.arange(graph_count, device=device)
+                source_graph = torch.searchsorted(
+                    selected_rank, (graph - num_dest_graphs + 1).clamp(min=1)
+                ).clamp(max=n - 1)
+                graph_shift = atom_ptr[:-1] - src_atoms._batch_ptr[source_graph]
+
                 for key in index_keys:
-                    rows = dest_edges._data[key][start:end]
-                    rows += edge_shift.to(rows.dtype)
+                    edges = dest_edges._data[key]
+                    row = torch.arange(edges.shape[0], device=device)
+                    # right=True skips zero-edge graphs at repeated boundaries.
+                    # Clamp unused rows so the offset gather remains in bounds.
+                    edge_graph = torch.searchsorted(
+                        edge_ptr[1:], row, right=True
+                    ).clamp(max=graph_count - 1)
+                    appended = (row >= edge_ptr[num_dest_graphs]) & (row < edge_ptr[-1])
+                    edges.copy_(
+                        torch.where(
+                            appended[:, None],
+                            edges + graph_shift[edge_graph, None].to(edges.dtype),
+                            edges,
+                        )
+                    )
 
         if source_index is None:
             copy_mask.copy_(fit_mask)

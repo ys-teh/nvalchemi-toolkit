@@ -3315,19 +3315,28 @@ class TestBatchPutDefrag:
     @pytest.mark.parametrize("num_systems", [2, 5])
     @pytest.mark.parametrize("prefill", [0, 1])
     @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("selected", [[True, False, True], [False, True, False]])
+    @pytest.mark.parametrize("empty_edges", [False, True])
     def test_put_offsets_neighbor_list_to_destination_atoms(
-        self, num_systems: int, prefill: int, index_dtype: torch.dtype, device: str
+        self,
+        num_systems: int,
+        prefill: int,
+        index_dtype: torch.dtype,
+        selected: list[bool],
+        empty_edges: bool,
+        device: str,
     ) -> None:
         """Copied edges point at the copied graph's atoms, even after a skipped graph."""
 
         def ring(num_nodes: int) -> AtomicData:
             atoms = torch.arange(num_nodes, device=device)
+            neighbors = torch.stack([atoms, atoms.roll(-1)], dim=1).to(index_dtype)
+            if empty_edges and num_nodes != 4:
+                neighbors = neighbors[:0]
             return AtomicData(
                 positions=torch.randn(num_nodes, 3, device=device),
                 atomic_numbers=torch.ones(num_nodes, dtype=torch.long, device=device),
-                neighbor_list=torch.stack([atoms, atoms.roll(-1)], dim=1).to(
-                    index_dtype
-                ),
+                neighbor_list=neighbors,
                 energy=torch.tensor([[0.0]], device=device),
             )
 
@@ -3340,6 +3349,8 @@ class TestBatchPutDefrag:
             template=source,
             device=device,
         )
+        raw_edges = buffer._storage.groups["edges"]._data["neighbor_list"]
+        raw_edges.fill_(-777)
         resident = [ring(3) for _ in range(prefill)]
         if resident:
             buffer.put(
@@ -3348,11 +3359,13 @@ class TestBatchPutDefrag:
             )
         copied = torch.zeros(3, dtype=torch.bool, device=device)
 
-        buffer.put(
-            source, torch.tensor([True, False, True], device=device), copied_mask=copied
-        )
+        buffer.put(source, torch.tensor(selected, device=device), copied_mask=copied)
 
-        expected_indices = [0, 2][: num_systems - prefill]
+        used_edges = int(buffer._storage.groups["edges"]._batch_ptr[buffer.num_graphs])
+        assert torch.all(raw_edges[used_edges:] == -777)
+        expected_indices = [index for index, value in enumerate(selected) if value][
+            : num_systems - prefill
+        ]
         assert copied.tolist() == [index in expected_indices for index in range(3)]
         for dest_index, source_index in enumerate(expected_indices, start=prefill):
             actual = buffer.get_data(dest_index)
@@ -3362,6 +3375,48 @@ class TestBatchPutDefrag:
         for resident_index, data in enumerate(resident):
             torch.testing.assert_close(
                 buffer.get_data(resident_index).neighbor_list, data.neighbor_list
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_put_edge_rebasing_does_not_synchronize(self) -> None:
+        """Edge rebasing keeps source selection and row bounds on the GPU."""
+        source = Batch.from_data_list(
+            [
+                _atomic_data_with_edges_and_system(count, count)
+                for count in (2, 3, 4, 5)
+            ],
+            device="cuda",
+        )
+        buffer = Batch.empty(
+            num_systems=6, num_nodes=30, num_edges=40, template=source, device="cuda"
+        )
+        edges = buffer._storage.groups["edges"]
+        original_put = edges.put
+        previous_mode = torch.cuda.get_sync_debug_mode()
+
+        def put_then_forbid_sync(
+            src: SegmentedLevelStorage,
+            mask: torch.Tensor,
+            *,
+            copied_mask: torch.Tensor | None = None,
+        ) -> None:
+            """Enable synchronization detection after all level copies finish."""
+            original_put(src, mask, copied_mask=copied_mask)
+            torch.cuda.set_sync_debug_mode("error")
+
+        try:
+            with patch.object(edges, "put", side_effect=put_then_forbid_sync):
+                buffer.put(
+                    source,
+                    torch.tensor([False, True, False, True], device="cuda"),
+                )
+            assert torch.cuda.get_sync_debug_mode() == 2
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_mode)
+
+        for dest, src in enumerate((1, 3)):
+            torch.testing.assert_close(
+                buffer.get_data(dest).neighbor_list, source.get_data(src).neighbor_list
             )
 
     @pytest.mark.parametrize("node_capacity, expected", [(1, 0), (2, 1), (5, 2)])
