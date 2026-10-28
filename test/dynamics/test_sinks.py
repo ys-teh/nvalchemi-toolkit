@@ -641,16 +641,20 @@ class TestHostMemory:
 
 
 class TestHostMemoryStorage:
-    """HostMemory stores bulk CPU copies that stay isolated from callers."""
+    """HostMemory stores per-graph CPU copies isolated from callers."""
 
-    def test_write_and_read_do_not_decompose_graphs(self, device: str) -> None:
-        """Grouped writes and reads stay bulk instead of rebuilding each graph."""
+    def test_write_decomposes_graphs(self, device: str) -> None:
+        """Grouped writes store one independently owned AtomicData per graph."""
         sink = HostMemory(capacity=100)
         batch = create_grouped_batch([3, 2], device=device)
-        with patch.object(Batch, "get_data", side_effect=AssertionError):
+        with patch.object(
+            Batch, "get_data", autospec=True, side_effect=Batch.get_data
+        ) as get_data:
             sink.write(batch)
             sink.write(batch, mask=torch.tensor([0, 0, 0, 1, 1], device=device) > 0)
             result = sink.read()
+        assert get_data.call_count == 7
+        assert all(isinstance(data, AtomicData) for data in sink._data_list)
         assert result.group_idx.tolist() == [0, 0, 0, 1, 1, 2, 2]
 
     def test_read_keeps_custom_fields_identity_and_connectivity(
@@ -757,7 +761,7 @@ class TestHostMemoryStorage:
         "padded_first,padded_second", [(True, False), (False, True), (True, True)]
     )
     def test_read_padded_writes(self, device, grouped, padded_first, padded_second):
-        """Whole-buffer writes retain capacity; merging excludes unoccupied rows."""
+        """Per-graph writes exclude unoccupied rows from padded buffers."""
         source = (
             create_grouped_batch([2, 1], device)
             if grouped
@@ -780,8 +784,8 @@ class TestHostMemoryStorage:
         sink = HostMemory(capacity=6)
         for batch in writes:
             sink.write(batch)
-        for stored, original in zip(sink._batches, writes, strict=True):
-            assert stored.system_capacity == original.system_capacity
+        assert len(sink._data_list) == 6
+        assert all(data.num_nodes == 2 for data in sink._data_list)
         result = sink.read()
         assert result.num_graphs == 6
         assert result.num_nodes == 12
@@ -808,23 +812,22 @@ class TestHostMemoryStorage:
         assert "status" in second
         assert result.group_idx.tolist() == [0, 0, 1, 2, 3, 3]
 
-    def test_failed_concatenation_keeps_stored_writes(self) -> None:
-        """A failed bulk merge leaves the original cached writes intact."""
+    def test_failed_decomposition_keeps_stored_samples(self) -> None:
+        """An invalid graph is rejected without changing previously stored data."""
         sink = HostMemory(capacity=10)
         first = create_test_batch(1)
         second = create_test_batch(1)
         second.positions = torch.ones(second.num_nodes, 4)
         sink.write(first)
-        sink.write(second)
-        stored = sink._batches.copy()
+        stored = sink._data_list.copy()
         for _ in range(2):
-            with pytest.raises(ValueError, match="incompatible trailing shapes"):
-                sink.read()
-            assert len(sink._batches) == len(stored)
+            with pytest.raises(ValueError, match="positions"):
+                sink.write(second)
+            assert len(sink._data_list) == len(stored)
             assert all(
-                actual is before for actual, before in zip(sink._batches, stored)
+                actual is before for actual, before in zip(sink._data_list, stored)
             )
-            torch.testing.assert_close(sink._batches[0].positions, first.positions)
+            torch.testing.assert_close(sink.read().positions, first.positions)
 
     def test_zero_allows_a_different_mode(self) -> None:
         """After zero() the sink accepts ungrouped data and starts empty."""
