@@ -1201,9 +1201,17 @@ class _CommunicationMixin:
             if callable(sync_state) and n_existing > 0
             else 0
         )
-        # index_select copies, which matters because callers such as
-        # _recv_to_batch zero the incoming buffer right after this call.
-        arrivals = incoming_batch.index_select(list(range(n_admitted)))
+        target_device = (
+            self.device if self.active_batch is None else self.active_batch.device
+        )
+        if n_admitted == n_incoming and incoming_batch.device != target_device:
+            # The device move below already copies, e.g. samples drained from
+            # host overflow. Trimmed views drop any preallocated padding.
+            arrivals = incoming_batch._without_padding()
+        else:
+            # index_select copies, which matters because callers such as
+            # _recv_to_batch zero the incoming buffer right after this call.
+            arrivals = incoming_batch.index_select(list(range(n_admitted)))
         # Reuse upstream outputs only when this stage has not opted into
         # reprime and arrivals carry every output it needs. Otherwise this
         # stage computes them before their first update.
@@ -1476,13 +1484,12 @@ class _CommunicationMixin:
         """Pull samples from overflow sinks into the active batch.
 
         Iterates through ``overflow_sinks`` in priority order.  For each
-        non-empty sink, drains its contents and routes them into the active
-        batch via :meth:`_buffer_to_batch`.  Stops early when the active
-        batch has no more room.  Result ``sinks`` are never read.
-
-        If the drained batch is larger than the remaining room,
-        ``_buffer_to_batch`` handles the partial-fit logic (accepts what
-        fits, overflows the rest back to overflow sinks).
+        non-empty sink, removes at most the remaining room's worth of its
+        oldest samples and routes them into the active batch via
+        :meth:`_buffer_to_batch`.  Samples that do not fit stay where they
+        are, so the cost follows the samples admitted rather than the
+        queue length.  Stops early when the active batch has no more room.
+        Result ``sinks`` are never read.
 
         Notes
         -----
@@ -1495,7 +1502,7 @@ class _CommunicationMixin:
                 break
             if len(sink) == 0:
                 continue
-            overflow = sink.drain()
+            overflow = sink.drain(max_samples=self.room_in_active_batch)
             self._buffer_to_batch(overflow)
 
     def _prestep_sync_buffers(self) -> None:
