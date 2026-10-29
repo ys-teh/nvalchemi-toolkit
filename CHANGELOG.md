@@ -21,6 +21,9 @@
 - `DistributedPipeline` no longer drains finished results back into
   computation. Received samples that do not fit wait in a new
   `overflow_sinks` list, a private `HostMemory` by default.
+- `DataSink.drain(max_samples=...)` limits refills to the oldest samples that
+  fit, and `HostMemory` leaves the remaining samples in place without copying
+  or rewriting them.
 - `Batch.append()` discards unused buffer rows in either input, preserving
   atom data and edge offsets while leaving the incoming batch unchanged.
 
