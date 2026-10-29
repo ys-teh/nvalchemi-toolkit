@@ -1099,8 +1099,8 @@ class _CommunicationMixin:
 
         n_incoming = incoming_batch.num_graphs
         n_admitted = min(room, n_incoming)
-        # index_select copies, which matters because callers such as
-        # _recv_to_batch zero the incoming buffer right after this call.
+        # index_select copies, so the active batch never aliases the caller's
+        # batch or its buffer padding.
         arrivals = incoming_batch.index_select(list(range(n_admitted)))
         self._admission_initialized = False
         # Reuse upstream outputs only when this stage has not opted into
@@ -1187,13 +1187,12 @@ class _CommunicationMixin:
             self._forces_primed = False
 
     def _recv_to_batch(self, incoming: Batch) -> None:
-        """Stage incoming data through the recv buffer into the active batch.
+        """Route received data into the active batch or overflow sinks.
 
-        When ``recv_buffer`` is available, copies *incoming* data into the
-        pre-allocated receive buffer via :meth:`Batch.put`, then routes the
-        buffer contents into the active batch via :meth:`_buffer_to_batch`.
-        When ``recv_buffer`` is ``None``, falls back to routing *incoming*
-        directly.
+        *incoming* is routed directly rather than through ``recv_buffer``.
+        The buffer's fields follow its template, so a copy could carry
+        placeholder outputs the prior stage never sent and hide that
+        arrivals need repriming.
 
         Parameters
         ----------
@@ -1204,13 +1203,7 @@ class _CommunicationMixin:
             self._recv_template = incoming
         if incoming.num_graphs > 0:
             self._on_receive(incoming)
-        if self.recv_buffer is not None and incoming.num_graphs > 0:
-            mask = torch.ones(incoming.num_graphs, dtype=torch.bool, device=self.device)
-            self.recv_buffer.put(incoming, mask=mask)
-            self._buffer_to_batch(self.recv_buffer)
-            self.recv_buffer.zero()
-        else:
-            self._buffer_to_batch(incoming)
+        self._buffer_to_batch(incoming)
 
     def _overflow_to_sinks(
         self, batch: Batch, mask: torch.Tensor | None = None

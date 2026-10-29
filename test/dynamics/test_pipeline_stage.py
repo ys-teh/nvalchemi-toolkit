@@ -1589,20 +1589,18 @@ class TestPrestepZerosSendBuffer:
 
 
 # ---------------------------------------------------------------------------
-# TestRecvToBatch — _recv_to_batch staging behavior
+# TestRecvToBatch — _recv_to_batch routing behavior
 # ---------------------------------------------------------------------------
 
 
 class TestRecvToBatch:
-    """Test that _recv_to_batch correctly stages data through recv_buffer."""
+    """Test how _recv_to_batch routes received data into the active batch."""
 
-    def test_recv_to_batch_uses_recv_buffer(self) -> None:
-        """Verify _recv_to_batch copies incoming to recv_buffer, routes, then zeros.
+    def test_recv_to_batch_routes_incoming_directly(self) -> None:
+        """Verify _recv_to_batch routes incoming without staging it in recv_buffer.
 
-        When recv_buffer is present:
-        1. recv_buffer.put(incoming, mask=all_true) is called
-        2. _buffer_to_batch(recv_buffer) is called
-        3. recv_buffer.zero() is called
+        The recv buffer's fields follow its template, so staging could add
+        placeholder outputs the prior stage never sent.
         """
         batch = _make_batch(num_graphs=3)
         cfg = BufferConfig(num_systems=10, num_nodes=100, num_edges=200)
@@ -1615,7 +1613,6 @@ class TestRecvToBatch:
             buffer_config=cfg,
         )
 
-        # Create a mock recv_buffer
         mock_recv_buffer = Mock()
         stage.recv_buffer = mock_recv_buffer
 
@@ -1624,20 +1621,9 @@ class TestRecvToBatch:
         with patch.object(stage, "_buffer_to_batch") as mock_b2b:
             stage._recv_to_batch(incoming)
 
-            # Verify recv_buffer.put was called with incoming and all-True mask
-            mock_recv_buffer.put.assert_called_once()
-            call_args = mock_recv_buffer.put.call_args
-            assert call_args[0][0] is incoming  # First positional arg is incoming
-            mask_arg = call_args[1]["mask"]
-            assert mask_arg.dtype == torch.bool
-            assert mask_arg.shape == (2,)
-            assert mask_arg.all()
-
-            # Verify _buffer_to_batch was called with recv_buffer
-            mock_b2b.assert_called_once_with(mock_recv_buffer)
-
-            # Verify recv_buffer.zero() was called after routing
-            mock_recv_buffer.zero.assert_called_once()
+            mock_b2b.assert_called_once_with(incoming)
+            mock_recv_buffer.put.assert_not_called()
+            mock_recv_buffer.zero.assert_not_called()
 
     def test_recv_to_batch_falls_back_on_empty_incoming(self) -> None:
         """Verify _recv_to_batch routes directly when incoming has 0 graphs.
